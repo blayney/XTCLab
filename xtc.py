@@ -5,6 +5,8 @@ from scipy.signal import fftconvolve
 import pysofaconventions as sofa
 import os
 from scipy.fft import fft, ifft, fftfreq
+from netCDF4 import Dataset
+import time
 
 def compute_speaker_positions_2D(distance=1.5, left_az_deg=-30, right_az_deg=30):
     """
@@ -74,6 +76,90 @@ def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0):
         "samplerate": samplerate
     }
 
+def save_to_sofa(filename, H_LL, H_LR, H_RL, H_RR, samplerate):
+    """
+    Save HRIRs to a SOFA file in the SimpleFreeFieldHRIR convention.
+
+    Parameters:
+    - filename: str, name of the output SOFA file
+    - H_LL, H_LR, H_RL, H_RR: numpy arrays, HRIRs for the four paths
+    - samplerate: int, sampling rate of the HRIRs
+    """
+    import os
+    if os.path.exists(filename):
+        os.remove(filename)
+
+    sofa_obj = Dataset(filename, mode="w", format="NETCDF4")
+
+    # Annoying Required Attributes
+    sofa_obj.Conventions = "SOFA"
+    sofa_obj.Version = "1.0"
+    sofa_obj.SOFAConventions = "SimpleFreeFieldHRIR"
+    sofa_obj.SOFAConventionsVersion = "0.3"
+    sofa_obj.APIName = "pysofaconventions"
+    sofa_obj.APIVersion = "0.3"
+    sofa_obj.AuthorContact = ""
+    sofa_obj.Organization = ""
+    sofa_obj.License = ""
+    sofa_obj.Title = "Simulated HRIR"
+    sofa_obj.DataType = "FIR"
+    sofa_obj.RoomType = "free field"
+    sofa_obj.DateCreated = time.ctime()
+    sofa_obj.DateModified = time.ctime()
+
+    # Required Dimensions
+    num_measurements = 2  # Left and Right speaker
+    num_receivers = 2  # Left and Right ear
+    num_samples = len(H_LL)  # HRIR length
+    num_coordinates = 3  # Cartesian coordinates (x, y, z)
+
+    # Define dimensions
+    sofa_obj.createDimension("M", num_measurements)  # Measurements
+    sofa_obj.createDimension("R", num_receivers)     # Receivers
+    sofa_obj.createDimension("N", num_samples)       # Samples
+    sofa_obj.createDimension("C", num_coordinates)   # Cartesian coordinates
+    sofa_obj.createDimension("I", 1)                 # Listener or Source
+
+    # Variables
+    ListenerPosition = sofa_obj.createVariable("ListenerPosition", "f8", ("I", "C"))
+    ListenerPosition.Units = "metre"
+    ListenerPosition.Type = "cartesian"
+    ListenerPosition[:] = np.array([[0.0, 0.0, 0.0]])
+
+    ListenerUp = sofa_obj.createVariable("ListenerUp", "f8", ("I", "C"))
+    ListenerUp.Units = "metre"
+    ListenerUp.Type = "cartesian"
+    ListenerUp[:] = np.array([[0.0, 0.0, 1.0]])
+
+    ListenerView = sofa_obj.createVariable("ListenerView", "f8", ("I", "C"))
+    ListenerView.Units = "metre"
+    ListenerView.Type = "cartesian"
+    ListenerView[:] = np.array([[0.0, 1.0, 0.0]])
+
+    # Save the source positions in spherical coordinates
+    # Spherical: [azimuth (degrees), elevation (degrees), distance (meters)]
+    SourcePosition = sofa_obj.createVariable("SourcePosition", "f8", ("M", "C"))
+    SourcePosition.Units = "degree, degree, metre"
+    SourcePosition.Type = "spherical"
+    SourcePosition[:] = np.array([
+        [-30.0, 0.0, 1.5],  # Left speaker at -30 degrees azimuth
+        [30.0, 0.0, 1.5],   # Right speaker at 30 degrees azimuth
+    ])
+
+    Data_IR = sofa_obj.createVariable("Data.IR", "f8", ("M", "R", "N"))
+    Data_IR.ChannelOrdering = "acn"
+    Data_IR.Normalization = "sn3d"
+    Data_IR[:] = np.array([
+        [H_LL, H_LR],  # Left speaker (to both ears)
+        [H_RL, H_RR],  # Right speaker (to both ears)
+    ])
+
+    Data_SamplingRate = sofa_obj.createVariable("Data.SamplingRate", "f8", ("I"))
+    Data_SamplingRate.Units = "hertz"
+    Data_SamplingRate[:] = [samplerate]
+
+    sofa_obj.close()
+    print(f"SOFA file saved as {filename}")
 
 def inspect_sofa_file(filepath):
     """
@@ -190,7 +276,7 @@ def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization
     #    M = [[h_ll, h_lr],
     #         [h_rl, h_rr]]
     # M^-1 = 1/det(M) * [[h_rr, -h_lr], [-h_rl, h_ll]]
-    # with small regularization 'eps' on the diagonal or in det(M).
+    # with regularization 'eps' on the diagonal or in det(M).
     eps = regularization
     F11_freq = np.zeros(N_fft, dtype=np.complex128)
     F12_freq = np.zeros(N_fft, dtype=np.complex128)
