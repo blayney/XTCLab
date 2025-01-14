@@ -8,3 +8,4 @@ Finally, the simulator includes an energy distribution calculator, which compute
 
 
 <img width="1201" alt="Screenshot 2025-01-14 at 16 58 35" src="https://github.com/user-attachments/assets/7e641ed9-e6ce-4a95-b6cc-f5752bd23326" />
+<img width="1450" alt="Screenshot 2025-01-14 at 17 06 15" src="https://github.com/user-attachments/assets/4dd0ba8a-4d6c-474b-b1a0-6d53c5aeabe3" />
