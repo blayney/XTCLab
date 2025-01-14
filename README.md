@@ -5,3 +5,6 @@ It also includes a Qt based simulator for demonstrating XTC, creating basic virt
 You can also recalculate new virtual HRTFs and XTC filters with the head anywhere in the space, adjust filter regularization and view the impact on transfer functions in real time.
 
 Finally, the simulator includes an energy distribution calculator, which computes the relative contralateral energy reduction for each point in the 4m x 4m virtual space around the ideal position, showing how the filter's resulting interference pattern radiates out from the speakers, and develops as you move away from the sweet spot. It's also interesting to see how the regularisation factor impacts this interference pattern.
+
+
+<img width="1201" alt="Screenshot 2025-01-14 at 16 58 35" src="https://github.com/user-attachments/assets/7e641ed9-e6ce-4a95-b6cc-f5752bd23326" />
