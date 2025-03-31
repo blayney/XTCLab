@@ -1,26 +1,44 @@
-#
-# This code simulates the effectiveness of an ideal 2x2 XTC filter configuration.
-# It loads a provided SOFA file and extracts two HRIR sets for ±30° azimuth.
-# It then generates 2x2 MIMO XTC filters and applies them two two ideal simulated
-# loudspeakers in space, with geometry matching that of the HRIRs.
-# It also computes the energy distribution of the crosstalk cancellation across a 
-# 4x4 meter grid, which provides information about how the HRIRs translate to filter
-# performance in space. At the moment, it doesn't really show substantial XTC at the
-# locations we expect, although I think this is due to shortcomings in the simulation
-# such as the lack of a head model, no 1/r2 attenuation, and the realities of an actual
-# HRIR from the dataset.
-#
-
 import numpy as np
+import random
+#from pythonosc.udp_client import SimpleUDPClient
+import threading
+import sounddevice as sd
 import pyqtgraph as pg
+import os
 from pyqtgraph.Qt import QtWidgets, QtCore
-from PyQt6.QtWidgets import QApplication, QMainWindow, QDockWidget
+from PyQt6.QtWidgets import QApplication, QMainWindow, QDockWidget, QComboBox, QLabel, QPushButton
 from PyQt6.QtCore import Qt
 from scipy.fft import fft
 from math import sin, cos, radians
 import xtc
+import level_meter
+from audio_engine import AudioEngine
 
-def simulate_xtc():
+def list_audio_outputs():
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        print("Available audio output devices:")
+        for i, device in enumerate(devices):
+            if device['max_output_channels'] > 0:
+                print(f"{i}: {device['name']}")
+    except Exception as e:
+        print("Error listing audio output devices:", e)
+
+
+# Audio comes out of a binaural renderer through a virtual audio device (output) called BlackHole 2ch
+# Use sounddevice to grab audio from the virtual microphone with the same name.
+def setup_audio_routing():
+    # Set up audio sources for left and right channels (BlackHole 2ch)
+    input_device_name_string = "BlackHole 2ch"
+    input_devices = sd.query_devices()
+    # set input_device to element in list with name input_device_name_string
+    input_device = input_devices[[i for i, device in enumerate(input_devices) if device['name'] == input_device_name_string][0]]
+    print(input_device)
+
+setup_audio_routing()
+
+def xtc_lab_processor():
     """
       (1) LeftEar=Impulse, RightEar=0
       (2) LeftEar=0,       RightEar=Impulse
@@ -39,7 +57,7 @@ def simulate_xtc():
     ideal_position = np.array([0.0, 1.0])
     ear_offset = 0.15
     scale_factor = 10.0
-    c = 343.0  # Speed of sound
+    c = 343.0
 
     xL = head_position[0] + distance * sin(radians(left_az_deg))
     yL = head_position[1] + distance * cos(radians(left_az_deg))
@@ -55,11 +73,22 @@ def simulate_xtc():
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
+            self.config = {
+                "binaural_device": "...",
+                "binaural_left_channel": 0,
+                "binaural_right_channel": 1,
+                "measurement_device": "...",
+                "measurement_channel": 0,
+                "playback_device": "...",
+                "playback_left_channel": 0,
+                "playback_right_channel": 1,
+                "hrtf_file": "filename.sofa"
+            }
 
             self.samplerate = None
 
-            self.setWindowTitle("XTC 2×2 MIMO Simulation + HRIR Generation")
-            self.resize(1200, 800)
+            self.setWindowTitle("XTC Lab Processor - Binaural Audio Processing")
+            self.resize(1920, 1080)
 
             # Instance variables
             self.f11_time = None
@@ -70,13 +99,79 @@ def simulate_xtc():
             self.regularization = 0.01
 
             self.energy_distribution_enabled = False
+            # Mixer Dock (Left Side)
+            self.mixerDock = QDockWidget("Mixer", self)
+            self.mixerDock.setFeatures(
+                QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable |
+                QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            )            
+            self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.mixerDock)
+
+            mixer_widget = QtWidgets.QWidget()
+            mixer_layout = QtWidgets.QHBoxLayout(mixer_widget)
+            mixer_layout.setContentsMargins(5, 5, 5, 5)
+            self.mixerDock.setWidget(mixer_widget)
+
+            # Define channels
+            channel_labels = ["In L", "In R", "Mic", "Out L", "Out R"]
+            self.meter_bars = []
+            self.faders = []
+
+            for label in channel_labels:
+                channel_widget = QtWidgets.QWidget()
+                channel_layout = QtWidgets.QVBoxLayout(channel_widget)
+                
+                label_widget = QtWidgets.QLabel(label)
+                label_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                meter_row = QtWidgets.QHBoxLayout()
+                meter = level_meter.LevelMeter()
+                meter.set_level(0.0)
+                
+                # Create vertical layout for dB scale
+                db_layout = QtWidgets.QVBoxLayout()
+                db_layout.setSpacing(0)
+                db_layout.setContentsMargins(0, 0, 0, 0)
+                
+                for db in range(0, -66, -6):
+                    tick = QtWidgets.QLabel(f"{db}")
+                    tick.setStyleSheet("font-size: 8px; color: white;")
+                    tick.setAlignment(Qt.AlignmentFlag.AlignRight)
+                    db_layout.addWidget(tick, 1)
+                
+                db_container = QtWidgets.QWidget()
+                db_container.setLayout(db_layout)
+                
+                meter_row.addWidget(db_container)
+                meter_row.addWidget(meter)
+                
+                fader = QtWidgets.QSlider(Qt.Orientation.Vertical)
+                fader.setRange(0, 100)
+                fader.setValue(80)
+                fader.setFixedHeight(200)
+                
+                channel_layout.addWidget(label_widget)
+                meter_container = QtWidgets.QWidget()
+                meter_container.setLayout(meter_row)
+                channel_layout.addWidget(meter_container, stretch=3)
+                channel_layout.addWidget(fader, stretch=1, alignment=Qt.AlignmentFlag.AlignHCenter)
+                # set maximum width of each channel strip
+                channel_widget.setMaximumWidth(60)
+                mixer_layout.addWidget(channel_widget)
+                self.meter_bars.append(meter)
+                self.faders.append(fader)
+                if label != channel_labels[-1]:
+                    separator = QtWidgets.QFrame()
+                    separator.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+                    separator.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+                    mixer_layout.addWidget(separator)
 
             # FFT Dock
             self.fftDock = QDockWidget("Crosstalk FFTs", self)
             features = (QDockWidget.DockWidgetFeature.DockWidgetMovable |
                         QDockWidget.DockWidgetFeature.DockWidgetFloatable)
             self.fftDock.setFeatures(features)
-            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.fftDock)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.fftDock)
 
             fft_container = QtWidgets.QWidget()
             fft_layout = QtWidgets.QGridLayout(fft_container)
@@ -172,6 +267,10 @@ def simulate_xtc():
             reset_button.clicked.connect(self.reset_head)
             center_layout.addWidget(reset_button)
 
+            settings_button = QtWidgets.QPushButton("Settings")
+            settings_button.clicked.connect(self.open_settings_menu)
+            center_layout.addWidget(settings_button)
+
             gen_button = QtWidgets.QPushButton("Generate HRIR & Reload Filters")
             gen_button.clicked.connect(self.generate_hrir_and_reload_filters)
             center_layout.addWidget(gen_button)
@@ -180,22 +279,164 @@ def simulate_xtc():
             self.energy_checkbox.stateChanged.connect(self.toggle_energy_distribution)
             center_layout.addWidget(self.energy_checkbox)
 
+
+            if self.config["binaural_device"] == "..." or self.config["playback_device"] == "...":
+                QtCore.QTimer.singleShot(100, self.open_settings_menu)
+
             self.auto_range_topdown_plot()
 
             self.load_default_filters()
 
             self.update_plot()
 
-        def update_regularization(self):
-            """
-            Update the regularization parameter from the slider and reload filters.
-            """
-            slider_value = self.reg_slider.value()
-            self.regularization = 10 ** (slider_value / 100 - 2)  # Convert to log scale
-            self.reg_label.setText(f"Regularization: {self.regularization:.4f}")
+        def open_settings_menu(self):
+            settings_dialog = QtWidgets.QDialog(self)
+            settings_dialog.setWindowTitle("Settings")
+            settings_dialog.setModal(True)
+            layout = QtWidgets.QVBoxLayout(settings_dialog)
 
-            # Reload filters with the updated regularization value
-            self.reload_filters_with_current_regularization()
+            devices = sd.query_devices()
+
+            # Device selectors
+            binaural_device_combo = QComboBox()
+            measurement_device_combo = QComboBox()
+            playback_device_combo = QComboBox()
+
+            for combo in [binaural_device_combo, measurement_device_combo, playback_device_combo]:
+                combo.addItem("")
+
+            for device in devices:
+                if device['max_input_channels'] > 0:
+                    binaural_device_combo.addItem(device['name'])
+                    measurement_device_combo.addItem(device['name'])
+                if device['max_output_channels'] > 0:
+                    playback_device_combo.addItem(device['name'])
+
+            layout.addWidget(QLabel("Select Binaural Device:"))
+            layout.addWidget(binaural_device_combo)
+
+            layout.addWidget(QLabel("Select Measurement Interface:"))
+            layout.addWidget(measurement_device_combo)
+
+            layout.addWidget(QLabel("Select Playback Interface:"))
+            layout.addWidget(playback_device_combo)
+
+            # Channel selectors
+            binaural_left_combo = QComboBox()
+            binaural_right_combo = QComboBox()
+            mic_combo = QComboBox()
+            playback_left_combo = QComboBox()
+            playback_right_combo = QComboBox()
+
+            layout.addWidget(QLabel("Select Binaural Left Channel:"))
+            layout.addWidget(binaural_left_combo)
+
+            layout.addWidget(QLabel("Select Binaural Right Channel:"))
+            layout.addWidget(binaural_right_combo)
+
+            layout.addWidget(QLabel("Select Microphone Channel:"))
+            layout.addWidget(mic_combo)
+
+            layout.addWidget(QLabel("Select Playback Left Channel:"))
+            layout.addWidget(playback_left_combo)
+
+            layout.addWidget(QLabel("Select Playback Right Channel:"))
+            layout.addWidget(playback_right_combo)
+
+            # HRTF file selection
+            hrtf_combo = QComboBox()
+            sofa_files = [f for f in os.listdir(".") if f.endswith(".sofa")]
+            hrtf_combo.addItem("")
+            for f in sofa_files:
+                hrtf_combo.addItem(f)
+
+            layout.addWidget(QLabel("Select HRTF File:"))
+            layout.addWidget(hrtf_combo)
+
+            # Helper to populate channels
+            def populate_channels(device_name, channel_combo_boxes, is_input):
+                channel_combo_boxes = channel_combo_boxes if isinstance(channel_combo_boxes, list) else [channel_combo_boxes]
+                for c in channel_combo_boxes:
+                    c.clear()
+                if not device_name:
+                    return
+
+                index = next((i for i, d in enumerate(devices) if d['name'] == device_name), None)
+                if index is None:
+                    return
+
+                channels = devices[index]['max_input_channels'] if is_input else devices[index]['max_output_channels']
+                for c in channel_combo_boxes:
+                    for ch in range(channels):
+                        c.addItem(f"Channel {ch + 1}", ch)
+
+            # Connect combo boxes to populate respective channels
+            binaural_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, [binaural_left_combo, binaural_right_combo], is_input=True))
+            measurement_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, mic_combo, is_input=True))
+            playback_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, [playback_left_combo, playback_right_combo], is_input=False))
+
+            # Save button
+            save_button = QPushButton("Save")
+            layout.addWidget(save_button)
+
+            def save_config():
+                self.config = {
+                    "binaural_device": binaural_device_combo.currentText(),
+                    "binaural_left_channel": binaural_left_combo.currentData(),
+                    "binaural_right_channel": binaural_right_combo.currentData(),
+                    "measurement_device": measurement_device_combo.currentText(),
+                    "measurement_channel": mic_combo.currentData(),
+                    "playback_device": playback_device_combo.currentText(),
+                    "playback_left_channel": playback_left_combo.currentData(),
+                    "playback_right_channel": playback_right_combo.currentData(),
+                    "hrtf_file": hrtf_combo.currentText()
+                }
+
+            print("Saving settings and initializing AudioEngine...")
+            self.audio_engine = AudioEngine(
+                config=self.config,
+                meter_callback=self.update_meters,
+                f11=self.f11_time,
+                f12=self.f12_time,
+                f21=self.f21_time,
+                f22=self.f22_time
+            )                
+            settings_dialog.accept()
+
+            save_button.clicked.connect(save_config)
+            
+            # Restore saved config values
+            binaural_device_combo.setCurrentText(self.config["binaural_device"])
+            measurement_device_combo.setCurrentText(self.config["measurement_device"])
+            playback_device_combo.setCurrentText(self.config["playback_device"])
+
+            populate_channels(self.config["binaural_device"], [binaural_left_combo, binaural_right_combo], is_input=True)
+            populate_channels(self.config["measurement_device"], mic_combo, is_input=True)
+            populate_channels(self.config["playback_device"], [playback_left_combo, playback_right_combo], is_input=False)
+
+            binaural_left_combo.setCurrentIndex(self.config["binaural_left_channel"] or 0)
+            binaural_right_combo.setCurrentIndex(self.config["binaural_right_channel"] or 0)
+            mic_combo.setCurrentIndex(self.config["measurement_channel"] or 0)
+            playback_left_combo.setCurrentIndex(self.config["playback_left_channel"] or 0)
+            playback_right_combo.setCurrentIndex(self.config["playback_right_channel"] or 0)
+            hrtf_combo.setCurrentText(self.config["hrtf_file"])
+
+            settings_dialog.exec()
+            
+        def update_meters(self, levels):
+            for i, level in enumerate(levels[:len(self.meter_bars)]):
+                self.meter_bars[i].set_level(level)
+
+        def update_regularization(self):
+                """
+                Update the regularization parameter from the slider and reload filters.
+                """
+                slider_value = self.reg_slider.value()
+                self.regularization = 10 ** (slider_value / 100 - 2)  # Convert to log scale
+                self.reg_label.setText(f"Regularization: {self.regularization:.4f}")
+
+                # Reload filters with the updated regularization value
+                self.reload_filters_with_current_regularization()
 
         def reload_filters_with_current_regularization(self):
             """
@@ -544,9 +785,11 @@ def simulate_xtc():
     # ---------------------------------------------
     # Run
     # ---------------------------------------------
+    list_audio_outputs()
     main_win = MainWindow()
     main_win.show()
     app.exec()
 
 if __name__ == "__main__":
-    simulate_xtc()
+    setup_audio_routing()
+    xtc_lab_processor()
