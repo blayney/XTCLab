@@ -1,3 +1,16 @@
+#
+# This code simulates the effectiveness of an ideal 2x2 XTC filter configuration.
+# It loads a provided SOFA file and extracts two HRIR sets for ±30° azimuth.
+# It then generates 2x2 MIMO XTC filters and applies them two two ideal simulated
+# loudspeakers in space, with geometry matching that of the HRIRs.
+# It also computes the energy distribution of the crosstalk cancellation across a 
+# 4x4 meter grid, which provides information about how the HRIRs translate to filter
+# performance in space. At the moment, it doesn't really show substantial XTC at the
+# locations we expect, although I think this is due to shortcomings in the simulation
+# such as the lack of a head model, no 1/r2 attenuation, and the realities of an actual
+# HRIR from the dataset.
+#
+
 import numpy as np
 import random
 #from pythonosc.udp_client import SimpleUDPClient
@@ -57,7 +70,7 @@ def xtc_lab_processor():
     ideal_position = np.array([0.0, 1.0])
     ear_offset = 0.15
     scale_factor = 10.0
-    c = 343.0
+    c = 343.0  # Speed of sound
 
     xL = head_position[0] + distance * sin(radians(left_az_deg))
     yL = head_position[1] + distance * cos(radians(left_az_deg))
@@ -274,6 +287,10 @@ def xtc_lab_processor():
             gen_button = QtWidgets.QPushButton("Generate HRIR & Reload Filters")
             gen_button.clicked.connect(self.generate_hrir_and_reload_filters)
             center_layout.addWidget(gen_button)
+            
+            self.bypass_checkbox = QtWidgets.QCheckBox("Bypass Filters")
+            self.bypass_checkbox.stateChanged.connect(self.update_audio_engine)
+            center_layout.addWidget(self.bypass_checkbox)
 
             self.energy_checkbox = QtWidgets.QCheckBox("Show Energy Distribution")
             self.energy_checkbox.stateChanged.connect(self.toggle_energy_distribution)
@@ -289,6 +306,19 @@ def xtc_lab_processor():
 
             self.update_plot()
 
+        def update_audio_engine(self):
+            if hasattr(self, "audio_engine"):
+                del self.audio_engine
+            self.audio_engine = AudioEngine(
+                config=self.config,
+                meter_callback=self.update_meters,
+                f11=self.f11_time,
+                f12=self.f12_time,
+                f21=self.f21_time,
+                f22=self.f22_time,
+                bypass=self.bypass_checkbox.isChecked()
+            )
+            
         def open_settings_menu(self):
             settings_dialog = QtWidgets.QDialog(self)
             settings_dialog.setWindowTitle("Settings")
@@ -393,14 +423,7 @@ def xtc_lab_processor():
                 }
 
             print("Saving settings and initializing AudioEngine...")
-            self.audio_engine = AudioEngine(
-                config=self.config,
-                meter_callback=self.update_meters,
-                f11=self.f11_time,
-                f12=self.f12_time,
-                f21=self.f21_time,
-                f22=self.f22_time
-            )                
+            self.update_audio_engine()
             settings_dialog.accept()
 
             save_button.clicked.connect(save_config)
@@ -793,3 +816,4 @@ def xtc_lab_processor():
 if __name__ == "__main__":
     setup_audio_routing()
     xtc_lab_processor()
+

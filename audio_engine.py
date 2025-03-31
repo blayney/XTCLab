@@ -3,7 +3,7 @@ import sounddevice as sd
 from PyQt6.QtCore import QTimer
 
 class AudioEngine:
-    def __init__(self, config, meter_callback=None, f11=None, f12=None, f21=None, f22=None):
+    def __init__(self, config, meter_callback=None, f11=None, f12=None, f21=None, f22=None, bypass=False):
         self.config = config
         self.meter_callback = meter_callback
         self.streams = []
@@ -17,6 +17,7 @@ class AudioEngine:
         self.timer.timeout.connect(self._update_meters)
         self.timer.start(30)
         print("AudioEngine initialized with config:", self.config)
+        self.bypass = bypass
  
         self._setup_streams()
 
@@ -33,14 +34,6 @@ class AudioEngine:
             print("Starting binaural input stream on:", self.config["binaural_device"])
             index = self._find_device_index(self.config["binaural_device"])
             print("Testing BlackHole with sd.rec()...")
-            try:
-                test_data = sd.rec(1024, samplerate=48000, channels=2, device=index)
-                sd.wait()
-                rms_L = np.sqrt(np.mean(test_data[:, 0]**2))
-                rms_R = np.sqrt(np.mean(test_data[:, 1]**2))
-                print(f"Manual test RMS: L={rms_L:.4f}, R={rms_R:.4f}")
-            except Exception as e:
-                print("Manual sd.rec test failed:", e)
             self.binaural_stream = sd.InputStream(
                 device=index,
                 channels=2,
@@ -107,7 +100,15 @@ class AudioEngine:
             normed.append(norm)
 
         if self.meter_callback:
-            self.meter_callback(normed)
+            if not hasattr(self, "_smoothed_levels"):
+                self._smoothed_levels = normed
+            else:
+                alpha = 0.2  # smoothing factor
+                self._smoothed_levels = [
+                    alpha * new + (1 - alpha) * old
+                    for new, old in zip(normed, self._smoothed_levels)
+                ]
+            self.meter_callback(self._smoothed_levels)
 
     def _output_callback(self, outdata, frames, time, status):
         outdata[:] = np.zeros((frames, 2), dtype=np.float32)
@@ -116,20 +117,24 @@ class AudioEngine:
             return
 
         try:
-            left = self.latest_binaural_block[:, 0]
-            right = self.latest_binaural_block[:, 1]
+            if self.bypass:
+                # Direct passthrough (bypass mode)
+                sig_L = self.latest_binaural_block[:, 0]
+                sig_R = self.latest_binaural_block[:, 1]
+            else:
+                left = self.latest_binaural_block[:, 0]
+                right = self.latest_binaural_block[:, 1]
+                sig_L = np.convolve(left, self.f11, mode='same') + np.convolve(right, self.f12, mode='same')
+                sig_R = np.convolve(left, self.f21, mode='same') + np.convolve(right, self.f22, mode='same')
 
-            # Apply MIMO XTC filters
-            sig_L = np.convolve(left, self.f11, mode='same') + np.convolve(right, self.f12, mode='same')
-            sig_R = np.convolve(left, self.f21, mode='same') + np.convolve(right, self.f22, mode='same')
+                sig_L = sig_L[:frames] if len(sig_L) >= frames else np.pad(sig_L, (0, frames - len(sig_L)))
+                sig_R = sig_R[:frames] if len(sig_R) >= frames else np.pad(sig_R, (0, frames - len(sig_R)))
+                outdata[:, 0] = sig_L
+                outdata[:, 1] = sig_R
 
-            # Truncate if needed
-            outdata[:, 0] = sig_L[:frames]
-            outdata[:, 1] = sig_R[:frames]
-
-            # Optional metering for output (not yet implemented)
-            self.levels[3] = np.sqrt(np.mean(sig_L**2))
-            self.levels[4] = np.sqrt(np.mean(sig_R**2))
+                # Optional metering for output (not yet implemented)
+                self.levels[3] = np.sqrt(np.mean(sig_L**2))
+                self.levels[4] = np.sqrt(np.mean(sig_R**2))
 
         except Exception as e:
             print("Error in output processing:", e)
