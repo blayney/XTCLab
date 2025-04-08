@@ -33,7 +33,6 @@ class AudioEngine:
             # Binaural input (2ch)
             print("Starting binaural input stream on:", self.config["binaural_device"])
             index = self._find_device_index(self.config["binaural_device"])
-            print("Testing BlackHole with sd.rec()...")
             self.binaural_stream = sd.InputStream(
                 device=index,
                 channels=2,
@@ -79,8 +78,8 @@ class AudioEngine:
     def _binaural_callback(self, indata, frames, time, status):
         if status:
             print("Binaural input stream status:", status)
-        print("Received audio in binaural callback.")
-        print(f"Binaural callback: indata shape {indata.shape}, RMS L={np.sqrt(np.mean(indata[:,0]**2)):.4f}")
+        # print("Received audio in binaural callback.")
+        # print(f"Binaural callback: indata shape {indata.shape}, RMS L={np.sqrt(np.mean(indata[:,0]**2)):.4f}")
         self.latest_binaural_block = indata.copy()
         rms = np.sqrt(np.mean(indata**2, axis=0))
         self.levels[0] = float(rms[0])
@@ -88,7 +87,7 @@ class AudioEngine:
     def _mic_callback(self, indata, frames, time, status):
         if status:
             print("Mic input stream status:", status)
-        print(f"Mic callback: indata shape {indata.shape}, RMS={np.sqrt(np.mean(indata**2)):.4f}")
+        # print(f"Mic callback: indata shape {indata.shape}, RMS={np.sqrt(np.mean(indata**2)):.4f}")
         rms = np.sqrt(np.mean(indata**2))
         self.levels[2] = float(rms)
 

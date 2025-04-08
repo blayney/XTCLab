@@ -225,23 +225,60 @@ def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0):
     sf = sofa.SOFAFile(filepath, 'r')
     hrir = sf.getDataIR()  # shape: (N, M, L)
     samplerate = sf.getSamplingRate()
+    source_positions = sf.getVariableValue('SourcePosition')  # (N, 3)
+    azimuths = source_positions[:, 0]
 
-    left_idx = find_sofa_index_for_azimuth(sf, left_az)
-    right_idx = find_sofa_index_for_azimuth(sf, right_az)
-    if left_idx is None or right_idx is None:
-        raise ValueError(f"Could not find angles {left_az} or {right_az} in the SOFA file.")
+    def interpolate_ir(target_az):
+        # Normalize azimuths to 0–360
+        wrapped_az = np.mod(azimuths, 360)
+        target_az = target_az % 360
 
-    # L->EarLeft, L->EarRight
-    H_LL = hrir[left_idx, 0, :]
-    H_LR = hrir[left_idx, 1, :]
+        diffs = wrapped_az - target_az
+        diffs[diffs > 180] -= 360
+        diffs[diffs < -180] += 360
+        sorted_indices = np.argsort(np.abs(diffs))
 
-    # R->EarLeft, R->EarRight
-    H_RL = hrir[right_idx, 0, :]
-    H_RR = hrir[right_idx, 1, :]
+        idx1, idx2 = sorted_indices[:2]
+        az1, az2 = wrapped_az[idx1], wrapped_az[idx2]
+        w2 = abs(target_az - az1) / (abs(az2 - az1) + 1e-9)
+        w1 = 1.0 - w2
+
+        hrir_1 = np.asarray(np.ma.filled(hrir[idx1], 0.0), dtype=np.float64)
+        hrir_2 = np.asarray(np.ma.filled(hrir[idx2], 0.0), dtype=np.float64)
+
+        # Align by delay (peak position) for both ears
+        aligned = []
+        for ear in range(2):
+            h1 = hrir_1[ear]
+            h2 = hrir_2[ear]
+
+            peak1 = np.argmax(np.abs(h1))
+            peak2 = np.argmax(np.abs(h2))
+            delay = peak1 - peak2
+            if delay > 0:
+                h2 = np.roll(h2, delay)
+            elif delay < 0:
+                h1 = np.roll(h1, -delay)
+
+            H1 = np.fft.fft(h1)
+            H2 = np.fft.fft(h2)
+            H_interp = w1 * H1 + w2 * H2
+            h_interp = np.fft.ifft(H_interp).real
+            aligned.append(h_interp)
+        # check whether arrays are masked:
+        
+        return np.stack(aligned, axis=0).astype(np.float64)
+
+    H_LL = interpolate_ir(left_az)[0]
+    H_LR = interpolate_ir(left_az)[1]
+    H_RL = interpolate_ir(right_az)[0]
+    H_RR = interpolate_ir(right_az)[1]
+    if np.ma.is_masked(H_LL) or np.ma.is_masked(H_LR) or np.ma.is_masked(H_RL) or np.ma.is_masked(H_RR):
+        print("masked found")
 
     sf.close()
     return {
-        "H_LL": H_LL,  # shape (L,)
+        "H_LL": H_LL,
         "H_LR": H_LR,
         "H_RL": H_RL,
         "H_RR": H_RR,
@@ -410,6 +447,10 @@ def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0):
     H_RR = hrir[right_idx, 1, :]
 
     sf.close()
+    H_LL = np.asarray(H_LL).astype(float)
+    H_LR = np.asarray(H_LR).astype(float)
+    H_RL = np.asarray(H_RL).astype(float)
+    H_RR = np.asarray(H_RR).astype(float)
     return {
         "H_LL": H_LL,  # shape (L,)
         "H_LR": H_LR,
@@ -419,64 +460,94 @@ def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0):
     }
 
 
-def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization=0.01):
+def generate_xtc_filters_from_geometry(
+    speaker_positions,
+    head_position,
+    ear_offset=0.15,
+    samplerate=48000,
+    num_taps=1024,
+    reflection_decay=0.9
+):
     """
-    Build 2x2 crosstalk canceller using the 4 IRs:
-      H_LL(t) = speaker L -> ear L
-      H_LR(t) = speaker L -> ear R
-      H_RL(t) = speaker R -> ear L
-      H_RR(t) = speaker R -> ear R
-
-    Returns 4 time-domain filters:
-      (F11, F12, F21, F22)
-    so that:
-      speaker_L(t) = F11 * ear_L(t) + F12 * ear_R(t)
-      speaker_R(t) = F21 * ear_L(t) + F22 * ear_R(t)
+    Generate ideal IRs (H_LL, H_LR, H_RL, H_RR) based on geometry, using delta functions with delay and amplitude.
+ 
+    Parameters:
+        speaker_positions: np.ndarray shape (2, 2), positions of Left and Right speakers (x, y)
+        head_position: np.ndarray shape (2,), position of head center (x, y)
+        ear_offset: float, distance between ears (meters)
+        samplerate: int, sampling rate
+        num_taps: int, number of samples in each IR
+        reflection_decay: float, optional decay factor for repeated delta trains (set to 0 to disable)
+ 
+    Returns:
+        dict with H_LL, H_LR, H_RL, H_RR, samplerate
     """
     import numpy as np
-    from scipy.fft import fft, ifft
+ 
+    c = 343.0  # speed of sound in m/s
+    L_ear = head_position + np.array([-ear_offset / 2, 0.0])
+    R_ear = head_position + np.array([ ear_offset / 2, 0.0])
+ 
+    def compute_ir(speaker_pos, ear_pos):
+        distance = np.linalg.norm(speaker_pos - ear_pos)
+        delay_samples = int(round((distance / c) * samplerate))
+        amplitude = 1.0 / (distance ** 2 + 1e-9)
+        ir = np.zeros(num_taps)
+        for n in range(0, num_taps, 2 * delay_samples if delay_samples > 0 else num_taps):
+            idx = n
+            if idx < num_taps:
+                ir[idx] += amplitude * (reflection_decay ** (n // delay_samples))
+        return ir
+ 
+    H_LL = compute_ir(speaker_positions[0], L_ear)
+    H_LR = compute_ir(speaker_positions[0], R_ear)
+    H_RL = compute_ir(speaker_positions[1], L_ear)
+    H_RR = compute_ir(speaker_positions[1], R_ear)
+ 
+    return {
+        "H_LL": H_LL,
+        "H_LR": H_LR,
+        "H_RL": H_RL,
+        "H_RR": H_RR,
+        "samplerate": samplerate
+    }
 
-    # 1) Zero-pad to consistent length
+def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization):
     L = max(len(H_LL), len(H_LR), len(H_RL), len(H_RR))
     N_fft = 2**int(np.ceil(np.log2(L)))
+
     h_ll = np.fft.fft(H_LL, n=N_fft)
     h_lr = np.fft.fft(H_LR, n=N_fft)
     h_rl = np.fft.fft(H_RL, n=N_fft)
     h_rr = np.fft.fft(H_RR, n=N_fft)
 
-    # 2) invert each frequency bin of the 2x2 matrix:
-    #    M = [[h_ll, h_lr],
-    #         [h_rl, h_rr]]
-    # M^-1 = 1/det(M) * [[h_rr, -h_lr], [-h_rl, h_ll]]
-    # with regularization 'eps' on the diagonal or in det(M).
-    eps = regularization
+    freqs = np.abs(np.fft.fftfreq(N_fft, d=1.0 / samplerate))
+    eps_array = regularization(freqs)
+
     F11_freq = np.zeros(N_fft, dtype=np.complex128)
     F12_freq = np.zeros(N_fft, dtype=np.complex128)
     F21_freq = np.zeros(N_fft, dtype=np.complex128)
     F22_freq = np.zeros(N_fft, dtype=np.complex128)
 
     for k in range(N_fft):
-        M11, M12 = h_ll[k], h_lr[k]
-        M21, M22 = h_rl[k], h_rr[k]
-        det = (M11*M22 - M12*M21) + eps
-        inv11 =  M22 / det
-        inv12 = -M12 / det
-        inv21 = -M21 / det
-        inv22 =  M11 / det
+        M = np.array([[h_ll[k], h_lr[k]],
+                      [h_rl[k], h_rr[k]]])
 
-        # So if input=[Ear_L, Ear_R], output=[Spk_L, Spk_R],
-        # then:
-        # F11=inv11, F12=inv12, F21=inv21, F22=inv22
-        F11_freq[k] = inv11
-        F12_freq[k] = inv12
-        F21_freq[k] = inv21
-        F22_freq[k] = inv22
+        det_M = h_ll[k] * h_rr[k] - h_lr[k] * h_rl[k]
+        denom = det_M + eps_array[k]
+        if np.abs(denom) > 1e-10:
+            Minv = np.array([[h_rr[k], -h_lr[k]],
+                             [-h_rl[k], h_ll[k]]]) / denom
+        else:
+            Minv = np.eye(2) * 1e-3
 
-    # 3) iFFT to get time-domain
-    f11_time = np.fft.ifft(F11_freq).real[:L]
-    f12_time = np.fft.ifft(F12_freq).real[:L]
-    f21_time = np.fft.ifft(F21_freq).real[:L]
-    f22_time = np.fft.ifft(F22_freq).real[:L]
+        F11_freq[k], F12_freq[k] = Minv[0, 0], Minv[0, 1]
+        F21_freq[k], F22_freq[k] = Minv[1, 0], Minv[1, 1]
+
+    f11_time = np.fft.ifft(F11_freq).real
+    f12_time = np.fft.ifft(F12_freq).real
+    f21_time = np.fft.ifft(F21_freq).real
+    f22_time = np.fft.ifft(F22_freq).real
 
     return f11_time, f12_time, f21_time, f22_time
 
@@ -939,5 +1010,35 @@ def main():
         else:
             print("Invalid choice. Please try again.")
 
+def test_xtc_filter_identity():
+    """
+    Simple test: use identity HRIRs and verify that the XTC filter becomes an identity matrix.
+    """
+    samplerate = 48000
+    L = 512
+    delta = np.zeros(L)
+    delta[0] = 1.0  # unit impulse
+
+    H_LL = delta.copy()
+    H_LR = np.zeros_like(delta)
+    H_RL = np.zeros_like(delta)
+    H_RR = delta.copy()
+
+    f11, f12, f21, f22 = generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization=1e-6)
+
+    def is_delta(sig):
+        return np.allclose(sig[1:], 0, atol=1e-6) and np.isclose(sig[0], 1.0, atol=1e-6)
+
+    assert is_delta(f11), "f11 should be delta"
+    assert is_delta(f22), "f22 should be delta"
+    assert np.allclose(f12, 0, atol=1e-6), "f12 should be zero"
+    assert np.allclose(f21, 0, atol=1e-6), "f21 should be zero"
+
+    print("test_xtc_filter_identity passed.")
+
+
+
 if __name__ == "__main__":
+    test_xtc_filter_identity()
     main()
+
