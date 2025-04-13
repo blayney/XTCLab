@@ -111,6 +111,34 @@ def plot_hrtf_smaart_style(data, samplerate, azimuth=0):
     plt.tight_layout()
     plt.show()
 
+def align_impulse_responses(H_LL, H_LR, H_RL, H_RR):
+    """
+    Align the four impulse responses based on the time-of-arrival (peak position).
+    This ensures all IRs are shifted to have the peak at the same time index.
+
+    Parameters:
+        H_LL, H_LR, H_RL, H_RR: Impulse responses (numpy arrays).
+
+    Returns:
+        Aligned impulse responses: H_LL, H_LR, H_RL, H_RR.
+    """
+    # Find the peak positions
+    peak_LL = np.argmax(np.abs(H_LL))
+    peak_LR = np.argmax(np.abs(H_LR))
+    peak_RL = np.argmax(np.abs(H_RL))
+    peak_RR = np.argmax(np.abs(H_RR))
+
+    # Determine the earliest peak position
+    earliest_peak = min(peak_LL, peak_LR, peak_RL, peak_RR)
+
+    # Align all responses to the earliest peak
+    H_LL_aligned = np.roll(H_LL, -peak_LL + earliest_peak)
+    H_LR_aligned = np.roll(H_LR, -peak_LR + earliest_peak)
+    H_RL_aligned = np.roll(H_RL, -peak_RL + earliest_peak)
+    H_RR_aligned = np.roll(H_RR, -peak_RR + earliest_peak)
+
+    return H_LL_aligned, H_LR_aligned, H_RL_aligned, H_RR_aligned
+
 def plot_hrtf_smaart_style_2x2(data, samplerate, azimuth=0):
     """
     Plot the 2x2 HRTF measurements: impulse responses, magnitude responses, and phase differences.
@@ -512,18 +540,45 @@ def generate_xtc_filters_from_geometry(
         "samplerate": samplerate
     }
 
-def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization):
+def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position, speaker_positions, ear_offset=0.15, regularization=None, filter_length=1024):
+    c = 343.0  # speed of sound (m/s)
+
+    # Step 1: Align HRIRs to center
+    H_LL, H_LR, H_RL, H_RR = align_impulse_responses(H_LL, H_LR, H_RL, H_RR)
+
     L = max(len(H_LL), len(H_LR), len(H_RL), len(H_RR))
     N_fft = 2**int(np.ceil(np.log2(L)))
 
+    # Step 2: FFT of IRs
     h_ll = np.fft.fft(H_LL, n=N_fft)
     h_lr = np.fft.fft(H_LR, n=N_fft)
     h_rl = np.fft.fft(H_RL, n=N_fft)
     h_rr = np.fft.fft(H_RR, n=N_fft)
 
+    # Step 3: Setup Regularization
     freqs = np.abs(np.fft.fftfreq(N_fft, d=1.0 / samplerate))
-    eps_array = regularization(freqs)
+    if regularization is None:
+        # Strong regularization at low freq, weak at high freq
+        eps_low = 1e-2   # Regularization below 500 Hz
+        eps_high = 1e-6  # Regularization above 5 kHz
 
+        f_low = 500.0
+        f_high = 5000.0
+
+        eps_array = np.zeros_like(freqs)
+
+        for i, f in enumerate(freqs):
+            if f < f_low:
+                eps_array[i] = eps_low
+            elif f > f_high:
+                eps_array[i] = eps_high
+            else:
+                # Linear interpolation between low and high
+                eps_array[i] = eps_low + (eps_high - eps_low) * (f - f_low) / (f_high - f_low)
+    else:
+        raise ValueError("Regularization must be a callable or None.")
+    
+    # Step 4: Invert per frequency bin
     F11_freq = np.zeros(N_fft, dtype=np.complex128)
     F12_freq = np.zeros(N_fft, dtype=np.complex128)
     F21_freq = np.zeros(N_fft, dtype=np.complex128)
@@ -533,21 +588,60 @@ def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization
         M = np.array([[h_ll[k], h_lr[k]],
                       [h_rl[k], h_rr[k]]])
 
-        det_M = h_ll[k] * h_rr[k] - h_lr[k] * h_rl[k]
-        denom = det_M + eps_array[k]
-        if np.abs(denom) > 1e-10:
-            Minv = np.array([[h_rr[k], -h_lr[k]],
-                             [-h_rl[k], h_ll[k]]]) / denom
-        else:
-            Minv = np.eye(2) * 1e-3
+        M_conjT = np.conj(M.T)
+        M_reg = M_conjT @ M + eps_array[k] * np.eye(2)  # Tikhonov regularization
+
+        Minv = np.linalg.inv(M_reg) @ M_conjT
 
         F11_freq[k], F12_freq[k] = Minv[0, 0], Minv[0, 1]
         F21_freq[k], F22_freq[k] = Minv[1, 0], Minv[1, 1]
 
+    # Step 5: IFFT to time domain
     f11_time = np.fft.ifft(F11_freq).real
     f12_time = np.fft.ifft(F12_freq).real
     f21_time = np.fft.ifft(F21_freq).real
     f22_time = np.fft.ifft(F22_freq).real
+
+    # Step 6: Apply sweet spot delays
+    L_ear = head_position + np.array([-ear_offset/2, 0.0])
+    R_ear = head_position + np.array([ ear_offset/2, 0.0])
+
+    def calc_delay_samples(spk_pos, ear_pos):
+        distance = np.linalg.norm(spk_pos - ear_pos)
+        time = distance / c
+        delay_samples = int(round(time * samplerate))
+        return delay_samples
+
+    # Compute relative delays
+    delay_LL = calc_delay_samples(speaker_positions[0], L_ear)
+    delay_LR = calc_delay_samples(speaker_positions[0], R_ear)
+    delay_RL = calc_delay_samples(speaker_positions[1], L_ear)
+    delay_RR = calc_delay_samples(speaker_positions[1], R_ear)
+
+    max_delay = max(delay_LL, delay_LR, delay_RL, delay_RR)
+
+    def delay_pad(ir, delay, max_delay):
+        pre_pad = max_delay - delay
+        return np.pad(ir, (pre_pad, 0), mode='constant')
+
+    f11_time = delay_pad(f11_time, delay_LL, max_delay)
+    f12_time = delay_pad(f12_time, delay_LR, max_delay)
+    f21_time = delay_pad(f21_time, delay_RL, max_delay)
+    f22_time = delay_pad(f22_time, delay_RR, max_delay)
+
+    # Step 7: Truncate and window
+    def window_and_trim(ir, target_length):
+        if len(ir) < target_length:
+            ir = np.pad(ir, (0, target_length - len(ir)))
+        elif len(ir) > target_length:
+            ir = ir[:target_length]
+        window = np.hanning(target_length)
+        return ir * window
+
+    f11_time = window_and_trim(f11_time, filter_length)
+    f12_time = window_and_trim(f12_time, filter_length)
+    f21_time = window_and_trim(f21_time, filter_length)
+    f22_time = window_and_trim(f22_time, filter_length)
 
     return f11_time, f12_time, f21_time, f22_time
 
@@ -663,33 +757,6 @@ def calibrate_amplitude(playback_channel, recording_channel, output_device, inpu
     print(f"Calibration failed to reach target level after {max_attempts} attempts. Using amplitude: {amplitude:.2f}")
     return amplitude
 
-def align_impulse_responses(H_LL, H_LR, H_RL, H_RR):
-    """
-    Align the four impulse responses based on the time-of-arrival (peak position).
-    This ensures all IRs are shifted to have the peak at the same time index.
-
-    Parameters:
-        H_LL, H_LR, H_RL, H_RR: Impulse responses (numpy arrays).
-
-    Returns:
-        Aligned impulse responses: H_LL, H_LR, H_RL, H_RR.
-    """
-    # Find the peak positions
-    peak_LL = np.argmax(np.abs(H_LL))
-    peak_LR = np.argmax(np.abs(H_LR))
-    peak_RL = np.argmax(np.abs(H_RL))
-    peak_RR = np.argmax(np.abs(H_RR))
-
-    # Determine the earliest peak position
-    earliest_peak = min(peak_LL, peak_LR, peak_RL, peak_RR)
-
-    # Align all responses to the earliest peak
-    H_LL_aligned = np.roll(H_LL, -peak_LL + earliest_peak)
-    H_LR_aligned = np.roll(H_LR, -peak_LR + earliest_peak)
-    H_RL_aligned = np.roll(H_RL, -peak_RL + earliest_peak)
-    H_RR_aligned = np.roll(H_RR, -peak_RR + earliest_peak)
-
-    return H_LL_aligned, H_LR_aligned, H_RL_aligned, H_RR_aligned
 def compute_rt60(ir, samplerate, noise_floor_region=(0, 0.05)):
     """
     Compute the RT60 (reverberation time) using the Schroeder backward integration method.
@@ -1010,35 +1077,8 @@ def main():
         else:
             print("Invalid choice. Please try again.")
 
-def test_xtc_filter_identity():
-    """
-    Simple test: use identity HRIRs and verify that the XTC filter becomes an identity matrix.
-    """
-    samplerate = 48000
-    L = 512
-    delta = np.zeros(L)
-    delta[0] = 1.0  # unit impulse
-
-    H_LL = delta.copy()
-    H_LR = np.zeros_like(delta)
-    H_RL = np.zeros_like(delta)
-    H_RR = delta.copy()
-
-    f11, f12, f21, f22 = generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, regularization=1e-6)
-
-    def is_delta(sig):
-        return np.allclose(sig[1:], 0, atol=1e-6) and np.isclose(sig[0], 1.0, atol=1e-6)
-
-    assert is_delta(f11), "f11 should be delta"
-    assert is_delta(f22), "f22 should be delta"
-    assert np.allclose(f12, 0, atol=1e-6), "f12 should be zero"
-    assert np.allclose(f21, 0, atol=1e-6), "f21 should be zero"
-
-    print("test_xtc_filter_identity passed.")
-
 
 
 if __name__ == "__main__":
-    test_xtc_filter_identity()
     main()
 

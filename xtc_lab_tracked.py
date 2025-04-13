@@ -110,6 +110,11 @@ def xtc_lab_processor():
             self.resize(1920, 1080)
 
             # Instance variables
+            self.h_ll = None
+            self.h_lr = None
+            self.h_rl = None
+            self.h_rr = None
+
             self.f11_time = None
             self.f12_time = None
             self.f21_time = None
@@ -209,25 +214,34 @@ def xtc_lab_processor():
             self.tf_curves = []
 
             titles = [
-                "Left Input → Ears (Transfer Function)",
-                "Right Input → Ears (Transfer Function)",
-                "Left Input Impulse Responses (f11, f12)",
-                "Right Input Impulse Responses (f21, f22)"
+                "TF: Left Speaker → Ears",
+                "TF: Right Speaker → Ears",
+                "Filter IR: f11",
+                "Filter IR: f12",
+                "Filter IR: f21",
+                "Filter IR: f22"
             ]
-
             colors = ['r', 'b']
             for i, title in enumerate(titles):
                 pw = pg.PlotWidget(title=title)
-                pw.setLabel("bottom", "Frequency (Hz)" if i < 2 else "Time (s)")
-                pw.setLabel("left", "Magnitude (dB)" if i < 2 else "Amplitude")
                 if i < 2:
-                    pw.enableAutoRange(axis='y', enable=True)
-                curve1 = pw.plot(pen=colors[0], name="Left Ear")
-                curve2 = pw.plot(pen=colors[1], name="Right Ear")
-                pw.addLegend()
+                    pw.setLabel("bottom", "Frequency (Hz)")
+                    pw.setLabel("left", "Magnitude (dB)")
+                else:
+                    pw.setLabel("bottom", "Time (s)")
+                    pw.setLabel("left", "Amplitude")
+                
+                if i < 2:  # TF plots
+                    curve1 = pw.plot(pen=colors[0])
+                    curve2 = pw.plot(pen=colors[1])
+                    self.tf_curves.append((curve1, curve2))
+                else:      # IR plots
+                    curve = pw.plot(pen=colors[0])
+                    self.tf_curves.append((curve,))
+                
                 self.tf_plots.append(pw)
-                self.tf_curves.append((curve1, curve2))
                 fft_layout.addWidget(pw, i // 2, i % 2)
+                
             self.plot = DraggablePlot(title="Geometric View")
             self.plot.setAspectLocked(True)
 
@@ -301,6 +315,10 @@ def xtc_lab_processor():
             gen_button = QtWidgets.QPushButton("Generate HRIR & Reload Filters")
             gen_button.clicked.connect(self.regenerate_filters_from_current_head_position)            
             center_layout.addWidget(gen_button)
+
+            synth_button = QtWidgets.QPushButton("Synthesize HRIRs")
+            synth_button.clicked.connect(self.synthesize_hrirs)
+            center_layout.addWidget(synth_button)
 
             self.bypass_checkbox = QtWidgets.QCheckBox("Bypass Filters")
             self.bypass_checkbox.stateChanged.connect(self.update_audio_engine)
@@ -437,6 +455,7 @@ def xtc_lab_processor():
                     "hrtf_file": hrtf_combo.currentText()
                 }
                 self.current_sofa_file = hrtf_combo.currentText()
+                
                 with open("xtc_lab_config.json", "w") as f:
                     import json
                     json.dump(self.config, f)
@@ -547,6 +566,8 @@ def xtc_lab_processor():
                 with self.filter_lock:
                     self.f11_time, self.f12_time, self.f21_time, self.f22_time = xtc.generate_xtc_filters_mimo(
                         H_LL, H_LR, H_RL, H_RR,
+                        head_position=head_position,
+                        speaker_positions=original_speaker_positions,
                         samplerate=self.samplerate,
                         regularization=regularization
                     )
@@ -560,7 +581,8 @@ def xtc_lab_processor():
             Regenerate filters based on the current head position and reload them.
             """
             print("Regenerating filters from current head position...")
-            self.reload_filters_with_current_regularization()      
+            self.reload_filters_with_current_regularization()  
+                
         def load_default_filters(self):
             """
             Load the default KEMAR HRIR filters.
@@ -577,8 +599,10 @@ def xtc_lab_processor():
 
                 self.f11_time, self.f12_time, self.f21_time, self.f22_time = xtc.generate_xtc_filters_mimo(
                     H_LL, H_LR, H_RL, H_RR,
+                    head_position=head_position,
+                    speaker_positions=original_speaker_positions,
                     samplerate=self.samplerate,
-                regularization=lambda freqs: np.full_like(freqs, self.regularization)
+                    regularization=lambda freqs: np.full_like(freqs, self.regularization)
                 )
                 print("Default filters loaded successfully.")
             except Exception as e:
@@ -722,6 +746,59 @@ def xtc_lab_processor():
 
             return xvals, yvals, energy_map
         
+        def synthesize_hrirs(self):
+            # This is a sanity check to check the inversion logic
+            # It generates a very basic set of HRIRs and loads them into the filter logic
+            # Generate ideal HRIRs based on head and speaker positions
+            ir_len = 512
+            samplerate = 48000
+            self.samplerate = samplerate
+
+            c = 343.0  # Speed of sound in m/s
+
+            def generate_impulse_response(speaker_pos, ear_pos):
+                distance = np.linalg.norm(speaker_pos - ear_pos)
+                delay_samples = int(round((distance / c) * samplerate))
+                delay_samples = 0
+                ir = np.zeros(ir_len)
+                if delay_samples < ir_len:
+                    ir[delay_samples] = 1.0 / (distance**2) # inverse square law
+                else:
+                    print(f"Warning: Delay samples {delay_samples} exceed IR length {ir_len}.")
+                return ir
+
+            L_ear = head_position + np.array([-ear_offset / 2, 0.0])
+            R_ear = head_position + np.array([ear_offset / 2, 0.0])
+            print("synthesize_hrirs: head_position:", head_position)
+            print("synthesize_hrirs: ear positions:", L_ear, R_ear)
+            print("synthesize_hrirs: speaker_position:", original_speaker_positions)
+
+            L_ear = head_position + np.array([-ear_offset / 2, 0.0])
+            R_ear = head_position + np.array([ear_offset / 2, 0.0])
+            H_LL = generate_impulse_response(original_speaker_positions[0], L_ear)
+            H_LR = generate_impulse_response(original_speaker_positions[0], R_ear)
+            H_RL = generate_impulse_response(original_speaker_positions[1], L_ear)
+            H_RR = generate_impulse_response(original_speaker_positions[1], R_ear)
+
+            self.h_ll = H_LL
+            self.h_lr = H_LR
+            self.h_rl = H_RL
+            self.h_rr = H_RR
+
+            # Pass the generated HRIRs to the filter generation logic
+            try:
+                with self.filter_lock:
+                    self.f11_time, self.f12_time, self.f21_time, self.f22_time = xtc.generate_xtc_filters_mimo(
+                        H_LL, H_LR, H_RL, H_RR,
+                        head_position=head_position,
+                        speaker_positions=original_speaker_positions,
+                        samplerate=samplerate,
+                        regularization=None
+                    )
+                self.update_plot()
+                print("Ideal HRIRs synthesized and filters generated successfully.")
+            except Exception as e:
+                print(f"Error synthesizing HRIRs: {e}")
 
         def update_plot(self):
             print("Updating plot...")
@@ -772,34 +849,45 @@ def xtc_lab_processor():
                 self.speaker_ear_labels[i].setPos(mid_scaled[0], mid_scaled[1])
                 self.speaker_ear_labels[i].setText(f"{dist_m:.2f} m\n{delay_ms:.2f} ms")
 
-            # Recompute the 4 lines for crosstalk using the MIMO filters: self.fXX_time
             lines = self.compute_transfer_functions_mimo_local()
-            for i, (freqs, mags) in enumerate(lines[:2]):
-                if isinstance(mags, tuple) and len(mags) == 2:
-                    self.tf_curves[i][0].setData(np.asarray(freqs), np.asarray(mags[0]))
-                    self.tf_curves[i][1].setData(np.asarray(freqs), np.asarray(mags[1]))
-
+            for i, data in enumerate(lines):
+                if i == 0:  # TF Left Speaker → Ears
+                    if len(data) == 4:
+                        freqs_left, mags_left, freqs_right, mags_right = data
+                        self.tf_curves[0][0].setData(freqs_left, mags_left)
+                        self.tf_curves[0][1].setData(freqs_right, mags_right)
+                elif i == 1:  # TF Right Speaker → Ears
+                    if len(data) == 4:
+                        freqs_left, mags_left, freqs_right, mags_right = data
+                        self.tf_curves[1][0].setData(freqs_left, mags_left)
+                        self.tf_curves[1][1].setData(freqs_right, mags_right)
+                else:  # Filter IRs
+                    if len(data) == 2:
+                        t, ir = data
+                        self.tf_curves[i][0].setData(t, ir)
         def compute_transfer_functions_mimo_local(self):
             """
-             Compute transfer functions for the current MIMO filters (self.f11_time, etc.)
-             and return the frequency response (magnitude in dB) for each path.
-             """
+            Compute transfer functions for the current MIMO filters (self.f11_time, etc.)
+            and return the frequency response (magnitude in dB) for each path.
+            """
             if any(f is None for f in [self.f11_time, self.f12_time, self.f21_time, self.f22_time]):
                 return [(np.array([0.0]), np.array([0.0]))] * 4
+            
             sig_len = 1024  # Length of the impulse response
             earL_imp = np.zeros(sig_len)
-            earL_imp[0] = 1.0  # Impulse for left ear
+            earL_imp[0] = 1.0
             earR_imp = np.zeros(sig_len)
-            earR_imp[0] = 1.0  # Impulse for right ear
+            earR_imp[0] = 1.0
 
             # Apply XTC filters
             netL_Limp, netR_Limp = self.apply_xtc_filters_mimo_local(head_position, earL_imp, np.zeros_like(earL_imp))
             netL_Rimp, netR_Rimp = self.apply_xtc_filters_mimo_local(head_position, np.zeros_like(earR_imp), earR_imp)
+
             # FFT for magnitude and frequency axis
             def fft_mag_db(signal):
                 fft_len = len(signal)
                 freq_axis = np.fft.fftfreq(fft_len, d=1.0 / self.samplerate)[:fft_len // 2]
-                magnitude = np.abs(fft(signal))[:fft_len // 2]
+                magnitude = np.abs(np.fft.fft(signal))[:fft_len // 2]
                 magnitude_db = 20 * np.log10(magnitude + 1e-12)
                 return freq_axis, magnitude_db
 
@@ -809,12 +897,7 @@ def xtc_lab_processor():
             f_RL, m_RL = fft_mag_db(netL_Rimp)
             f_RR, m_RR = fft_mag_db(netR_Rimp)
 
-            self.tf_curves[0][0].setData(f_LL, m_LL)
-            self.tf_curves[0][1].setData(f_LR, m_LR)
-            self.tf_curves[1][0].setData(f_RL, m_RL)
-            self.tf_curves[1][1].setData(f_RR, m_RR)
-
-            # Plot IRs
+            # Plot 4 IRs: f11, f12, f21, f22
             if self.f11_time is not None:
                 def align_by_peak(ir):
                     peak_index = np.argmax(np.abs(ir))
@@ -827,13 +910,20 @@ def xtc_lab_processor():
                 f22_centered = align_by_peak(self.f22_time)
 
                 t = np.arange(len(f11_centered)) / self.samplerate
-                self.tf_curves[2][0].setData(t, f11_centered)
-                self.tf_curves[2][1].setData(t, f12_centered)
-                self.tf_curves[3][0].setData(t, f21_centered)
-                self.tf_curves[3][1].setData(t, f22_centered)
 
-            return [(f_LL, m_LL), (f_LR, m_LR), (f_RL, m_RL), (f_RR, m_RR)]
+                self.tf_curves[2][0].setData(t, f11_centered)  # f11
+                self.tf_curves[3][0].setData(t, f12_centered)  # f12
+                self.tf_curves[4][0].setData(t, f21_centered)  # f21
+                self.tf_curves[5][0].setData(t, f22_centered)  # f22
 
+            return [
+                (f_LL, m_LL, f_LR, m_LR),   # TF Left speaker
+                (f_RL, m_RL, f_RR, m_RR),   # TF Right speaker
+                (t, f11_centered),
+                (t, f12_centered),
+                (t, f21_centered),
+                (t, f22_centered)
+            ]        
         def apply_xtc_filters_mimo_local(self, head_pos, earL, earR):
             """
             Same logic as apply_xtc_filters_mimo, but uses self.f11_time, etc.
@@ -877,18 +967,31 @@ def xtc_lab_processor():
 
         def open_hrir_inspection_modal(self):
             try:
-                data_4 = xtc.extract_4_ir_sofa(self.current_sofa_file, left_az=-30.0, right_az=30.0)
-                print("Opened modal and extracted HRIRs")
+                if self.h_ll is not None:
+                    data_4 = {
+                        "H_LL": self.h_ll,
+                        "H_LR": self.h_lr,
+                        "H_RL": self.h_rl,
+                        "H_RR": self.h_rr,
+                        "samplerate": self.samplerate
+                    }
+                else:
+                    data_4 = xtc.extract_4_ir_sofa(self.current_sofa_file, left_az=-30.0, right_az=30.0)
+                    print("Opened modal and extracted HRIRs")
                 H_LL, H_LR, H_RL, H_RR = xtc.align_impulse_responses(
                     data_4["H_LL"], data_4["H_LR"], data_4["H_RL"], data_4["H_RR"]
                 )
                 print("Aligned HRIRs")
                 samplerate = data_4["samplerate"]
-                f11, f12, f21, f22 = xtc.generate_xtc_filters_mimo(
-                    H_LL, H_LR, H_RL, H_RR,
-                    samplerate=samplerate,
-                    regularization=lambda freqs: np.full_like(freqs, self.regularization)
-                )
+                with self.filter_lock:
+                                    f11, f12, f21, f22 = xtc.generate_xtc_filters_mimo(
+                                        H_LL, H_LR, H_RL, H_RR,
+                                        head_position=head_position,
+                                        speaker_positions=original_speaker_positions,
+                                        samplerate=samplerate,
+                                        regularization=None
+                                    )
+                print("called generate_xtc_filters_mimo")
             except Exception as e:
                 print(f"Error loading HRIRs: {e}")
                 return
@@ -912,6 +1015,48 @@ def xtc_lab_processor():
             plot_ir_row("HRIRs: H_LR and H_RL", H_LR, H_RL)
             plot_ir_row("Inverted Filters: f11 and f22", f11, f22)
             plot_ir_row("Inverted Filters: f12 and f21", f12, f21)
+
+            def open_fft_viewer(H_LL, H_LR, H_RL, H_RR):
+                # plot each fft of each IR separately , top grid of 4 H matrix
+                # bottom grid of 4 inverted filter matrices f11, f12, f21, f22 etc
+                dialog = QtWidgets.QDialog(self)
+                dialog.setWindowTitle("FFT Viewer")
+                layout = QtWidgets.QVBoxLayout(dialog)
+
+                plot_widget = pg.GraphicsLayoutWidget()
+                layout.addWidget(plot_widget)
+
+                def plot_fft_row(title, data_left, data_right):
+                    p = plot_widget.addPlot(title=title)
+                    fft_len = len(data_left)
+                    freq_axis = np.fft.fftfreq(fft_len, d=1.0 / samplerate)[:fft_len // 2]
+                    fft_left = 20 * np.log10(np.abs(np.fft.fft(data_left))[:fft_len // 2] + 1e-12)
+                    fft_right = 20 * np.log10(np.abs(np.fft.fft(data_right))[:fft_len // 2] + 1e-12)
+                    p.plot(freq_axis, fft_left, pen='r', name="Left")
+                    p.plot(freq_axis, fft_right, pen='b', name="Right")
+                    p.setLabel("bottom", "Frequency (Hz)")
+                    p.setLabel("left", "Magnitude (dB)")
+                    p.showGrid(x=True, y=True)
+                    plot_widget.nextRow()
+
+                # Top row: FFTs of HRIRs
+                plot_fft_row("FFT: H_LL", H_LL, H_RR)
+                plot_fft_row("FFT: H_LR", H_LR, H_RL)
+
+                # Bottom row: FFTs of inverted filters
+                plot_fft_row("FFT: f11", f11, f22)
+                plot_fft_row("FFT: f12", f12, f21)
+
+                close_btn = QtWidgets.QPushButton("Close")
+                close_btn.clicked.connect(dialog.accept)
+                layout.addWidget(close_btn)
+
+                dialog.resize(800, 600)
+                dialog.exec()
+
+            view_ffts_btn = QtWidgets.QPushButton("View FFTs")
+            view_ffts_btn.clicked.connect(lambda: open_fft_viewer(H_LL, H_LR, H_RL, H_RR))
+            layout.addWidget(view_ffts_btn)
 
             close_btn = QtWidgets.QPushButton("Close")
             close_btn.clicked.connect(dialog.accept)
