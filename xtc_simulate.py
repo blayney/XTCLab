@@ -204,16 +204,18 @@ def simulate_xtc():
             print(f"Reloading filters from {self.current_sofa_file} with regularization: {self.regularization:.4f}")
 
             try:
-                data_4 = xtc.extract_4_ir_sofa(self.current_sofa_file, left_az=-30.0, right_az=30.0)
-                H_LL = data_4["H_LL"]
-                H_LR = data_4["H_LR"]
-                H_RL = data_4["H_RL"]
-                H_RR = data_4["H_RR"]
-
+                left_az_deg, right_az_deg = self.get_azimuth_pair()                
+                HRIR_LL, HRIR_LR, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg)
+                HRIR_RL, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg)
+                assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
+                self.samplerate = sample_rate_l[0]
+                H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
                 self.f11_time, self.f12_time, self.f21_time, self.f22_time = xtc.generate_xtc_filters_mimo(
                     H_LL, H_LR, H_RL, H_RR,
+                    head_position=head_position,
+                    speaker_positions=original_speaker_positions,
                     samplerate=self.samplerate,
-                    regularization=self.regularization
+                    regularization=None
                 )
                 print("Filters reloaded successfully.")
                 self.update_plot()

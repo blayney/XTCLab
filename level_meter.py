@@ -4,7 +4,7 @@ class LevelMeter(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.level = 0.0  # Linear scale (0.0 - 1.0)
-        self.setFixedWidth(12)
+        self.setFixedWidth(8)
         self.setMinimumHeight(200)
         self.update()  # Ensure initial painting
 

@@ -3,10 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import fftconvolve
 import pysofaconventions as sofa
+import spatialaudiometrics
 import os
 from scipy.fft import fft, ifft, fftfreq
 from netCDF4 import Dataset
 import time
+
+import spatialaudiometrics.load_data
+import spatialaudiometrics.visualisation
 
 def compute_speaker_positions_2D(distance=1.5, left_az_deg=-30, right_az_deg=30):
     """
@@ -111,33 +115,72 @@ def plot_hrtf_smaart_style(data, samplerate, azimuth=0):
     plt.tight_layout()
     plt.show()
 
-def align_impulse_responses(H_LL, H_LR, H_RL, H_RR):
+def align_impulse_responses(H_LL, H_LR, H_RL, H_RR, threshold_db=-60.0):
     """
-    Align the four impulse responses based on the time-of-arrival (peak position).
-    This ensures all IRs are shifted to have the peak at the same time index.
+    Remove free-field delays from HRIRs while preserving ITDs.
+    Each speaker's HRIRs are shifted based on the direct-path arrival.
 
     Parameters:
-        H_LL, H_LR, H_RL, H_RR: Impulse responses (numpy arrays).
+        H_LL, H_LR, H_RL, H_RR: HRIRs as numpy arrays.
+        threshold_db: Threshold in dB above noise floor to detect first significant arrival.
 
     Returns:
-        Aligned impulse responses: H_LL, H_LR, H_RL, H_RR.
+        Aligned impulse responses: H_LL_new, H_LR_new, H_RL_new, H_RR_new
     """
-    # Find the peak positions
-    peak_LL = np.argmax(np.abs(H_LL))
-    peak_LR = np.argmax(np.abs(H_LR))
-    peak_RL = np.argmax(np.abs(H_RL))
-    peak_RR = np.argmax(np.abs(H_RR))
+    import numpy as np
 
-    # Determine the earliest peak position
-    earliest_peak = min(peak_LL, peak_LR, peak_RL, peak_RR)
+    def find_first_above_threshold(ir, threshold_db):
+        """Find the first sample above the threshold relative to max."""
+        energy_db = 20 * np.log10(np.abs(ir) + 1e-12)
+        max_db = np.max(energy_db)
+        threshold = max_db + threshold_db
+        idx = np.argmax(energy_db >= threshold)
+        return idx - 10 # shift back 10 samples to avoid clipping pre ringing
 
-    # Align all responses to the earliest peak
-    H_LL_aligned = np.roll(H_LL, -peak_LL + earliest_peak)
-    H_LR_aligned = np.roll(H_LR, -peak_LR + earliest_peak)
-    H_RL_aligned = np.roll(H_RL, -peak_RL + earliest_peak)
-    H_RR_aligned = np.roll(H_RR, -peak_RR + earliest_peak)
+    # Group by speaker
+    delay_LL = find_first_above_threshold(H_LL, threshold_db)
+    delay_RR = find_first_above_threshold(H_RR, threshold_db)
 
-    return H_LL_aligned, H_LR_aligned, H_RL_aligned, H_RR_aligned
+    # For left speaker: align based on LEFT->LEFT
+    shift_left = delay_LL
+    H_LL_new = np.roll(H_LL, -shift_left)
+    H_LR_new = np.roll(H_LR, -shift_left)
+
+    # For right speaker: align based on RIGHT->RIGHT
+    shift_right = delay_RR
+    H_RL_new = np.roll(H_RL, -shift_right)
+    H_RR_new = np.roll(H_RR, -shift_right)
+
+    # Zero out samples that rolled in from the end
+    H_LL_new[-shift_left:] = 0.0
+    H_LR_new[-shift_left:] = 0.0
+    H_RL_new[-shift_right:] = 0.0
+    H_RR_new[-shift_right:] = 0.0
+
+    # Debug plot for visual sanity check
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 6))
+    plt.subplot(2, 1, 1)
+    plt.title("Before Alignment")
+    plt.plot(H_LL, label="H_LL")
+    plt.plot(H_LR, label="H_LR")
+    plt.plot(H_RL, label="H_RL")
+    plt.plot(H_RR, label="H_RR")
+    plt.legend()
+    plt.grid()
+
+    plt.subplot(2, 1, 2)
+    plt.title("After Alignment")
+    plt.plot(H_LL_new, label="H_LL_new")
+    plt.plot(H_LR_new, label="H_LR_new")
+    plt.plot(H_RL_new, label="H_RL_new")
+    plt.plot(H_RR_new, label="H_RR_new")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.show()
+
+    return H_LL_new, H_LR_new, H_RL_new, H_RR_new
 
 def plot_hrtf_smaart_style_2x2(data, samplerate, azimuth=0):
     """
@@ -241,77 +284,39 @@ def find_sofa_index_for_azimuth(sf, target_az_deg, tolerance=2.5):
     for i, pos in enumerate(source_positions):
         azimuth = pos[0] % 360
         diff = min(abs(azimuth - target_az_deg), 360 - abs(azimuth - target_az_deg))
-        if diff < best_diff and diff <= tolerance:
+        if diff < best_diff and diff <= tolerance and pos[1] == 0:
             best_idx = i
             best_diff = diff
     return best_idx
 
-def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0):
-    """
-    Extract the four IRs (H_LL, H_LR, H_RL, H_RR) from the angles left_az, right_az.
-    """
-    sf = sofa.SOFAFile(filepath, 'r')
-    hrir = sf.getDataIR()  # shape: (N, M, L)
-    samplerate = sf.getSamplingRate()
-    source_positions = sf.getVariableValue('SourcePosition')  # (N, 3)
-    azimuths = source_positions[:, 0]
+def extract_hrirs_sam(filepath, source_az, show_plots = False, attempt_interpolate=False):
+    # If we're not attempting to interpolate, round to the nearest 5 degrees
+    hrtf = spatialaudiometrics.load_data.HRTF(filepath)
+    if source_az < 0:
+        source_az += 360
 
-    def interpolate_ir(target_az):
-        # Normalize azimuths to 0–360
-        wrapped_az = np.mod(azimuths, 360)
-        target_az = target_az % 360
+    if not attempt_interpolate:
+        source_az = round(source_az / 5) * 5
 
-        diffs = wrapped_az - target_az
-        diffs[diffs > 180] -= 360
-        diffs[diffs < -180] += 360
-        sorted_indices = np.argsort(np.abs(diffs))
+        idx = np.where((hrtf.locs[:,0] == source_az) & (hrtf.locs[:,1] == 0))[0][0]
 
-        idx1, idx2 = sorted_indices[:2]
-        az1, az2 = wrapped_az[idx1], wrapped_az[idx2]
-        w2 = abs(target_az - az1) / (abs(az2 - az1) + 1e-9)
-        w1 = 1.0 - w2
-
-        hrir_1 = np.asarray(np.ma.filled(hrir[idx1], 0.0), dtype=np.float64)
-        hrir_2 = np.asarray(np.ma.filled(hrir[idx2], 0.0), dtype=np.float64)
-
-        # Align by delay (peak position) for both ears
-        aligned = []
-        for ear in range(2):
-            h1 = hrir_1[ear]
-            h2 = hrir_2[ear]
-
-            peak1 = np.argmax(np.abs(h1))
-            peak2 = np.argmax(np.abs(h2))
-            delay = peak1 - peak2
-            if delay > 0:
-                h2 = np.roll(h2, delay)
-            elif delay < 0:
-                h1 = np.roll(h1, -delay)
-
-            H1 = np.fft.fft(h1)
-            H2 = np.fft.fft(h2)
-            H_interp = w1 * H1 + w2 * H2
-            h_interp = np.fft.ifft(H_interp).real
-            aligned.append(h_interp)
-        # check whether arrays are masked:
-        
-        return np.stack(aligned, axis=0).astype(np.float64)
-
-    H_LL = interpolate_ir(left_az)[0]
-    H_LR = interpolate_ir(left_az)[1]
-    H_RL = interpolate_ir(right_az)[0]
-    H_RR = interpolate_ir(right_az)[1]
-    if np.ma.is_masked(H_LL) or np.ma.is_masked(H_LR) or np.ma.is_masked(H_RL) or np.ma.is_masked(H_RR):
-        print("masked found")
-
-    sf.close()
-    return {
-        "H_LL": H_LL,
-        "H_LR": H_LR,
-        "H_RL": H_RL,
-        "H_RR": H_RR,
-        "samplerate": samplerate
-    }
+        hrir_l = hrtf.hrir[idx,0,:]
+        hrir_r = hrtf.hrir[idx,1,:]
+    
+    else:
+        # throw an error - not implemented yet
+        raise NotImplementedError("Interpolation not implemented yet.")
+    
+    if(show_plots):
+        fig,gs = spatialaudiometrics.visualisation.create_fig()
+        axes = fig.add_subplot(gs[1:6,1:6])
+        spatialaudiometrics.visualisation.plot_hrir_both_ears(hrtf,source_az,0,axes)
+        axes = fig.add_subplot(gs[1:6,7:12])
+        spatialaudiometrics.visualisation.plot_itd_overview(hrtf)
+        spatialaudiometrics.visualisation.show()
+        plt.show()  # Explicitly call plt.show() to keep the plot open????
+    samplerate = sofa.SOFAFile(filepath, 'r').getSamplingRate()
+    return hrir_l, hrir_r, samplerate
 
 def save_to_sofa(filename, H_LL, H_LR, H_RL, H_RR, samplerate):
     """
@@ -420,7 +425,6 @@ def inspect_sofa_file(filepath):
 
     sf.close()
 
-
 def find_sofa_index_for_azimuth(sf, target_az_deg, tolerance=2.5):
     """
     Find the index in the SOFA file closest to a given azimuth (within tolerance).
@@ -445,15 +449,17 @@ def find_sofa_index_for_azimuth(sf, target_az_deg, tolerance=2.5):
     
     for i, pos in enumerate(source_positions):
         azimuth = pos[0] % 360  # Normalize the azimuth in the SOFA file
+        elevation = pos[1]
         diff = min(abs(azimuth - target_az_deg), 360 - abs(azimuth - target_az_deg))  # Account for circular wrapping
 
-        if diff < best_diff and diff <= tolerance:
+        if diff < best_diff and diff <= tolerance and elevation == 0:
+            assert elevation == 0, f"============== ELEVATION NONZERO ==============="
             best_idx = i
             best_diff = diff
 
     return best_idx
 
-def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0):
+def extract_4_ir_sofa(filepath, left_az=-30.0, right_az=30.0, debug = False):
     """
     Extract the four IRs (H_LL, H_LR, H_RL, H_RR) from the angles left_az, right_az.
     """
@@ -539,16 +545,377 @@ def generate_xtc_filters_from_geometry(
         "H_RR": H_RR,
         "samplerate": samplerate
     }
+def generate_xtc_filters_mimo_cf(
+    H_LL, H_LR, H_RL, H_RR,
+    samplerate, head_position, speaker_positions,
+    ear_offset=0.15, regularization=None,
+    filter_length=4096, delay_compensation=True
+):
+    """
+    Generate XTC filters using regularized frequency-domain inversion (from Mouchtaris et al.).
 
-def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position, speaker_positions, ear_offset=0.15, regularization=None, filter_length=1024):
+    Parameters:
+        H_LL, H_LR, H_RL, H_RR: HRIRs (assumed free-field compensated)
+        samplerate: sample rate (Hz)
+        head_position: (x, y) of head center
+        speaker_positions: [[xL, yL], [xR, yR]]
+        ear_offset: interaural distance (default 0.15m)
+        regularization: scalar regularization constant or None (default 0.05)
+        filter_length: length of each filter (samples)
+        delay_compensation: whether to pad filters based on speaker/ear delays
+
+    Returns:
+        f11, f12, f21, f22 (numpy arrays)
+    """
+    import numpy as np
+
+    c = 343.0  # Speed of sound (m/s)
+    b = regularization if regularization is not None else 0.05
+
+    # Step 1: Pad all IRs to same length
+    L = max(len(H_LL), len(H_LR), len(H_RL), len(H_RR))
+    N_fft = 2 ** int(np.ceil(np.log2(L)))
+
+    def pad(ir):
+        return np.pad(ir, (0, N_fft - len(ir)), mode='constant') if len(ir) < N_fft else ir[:N_fft]
+
+    HRIRs = np.zeros((2, 2, N_fft))
+    HRIRs[0, 0, :] = pad(H_LL)
+    HRIRs[0, 1, :] = pad(H_LR)
+    HRIRs[1, 0, :] = pad(H_RL)
+    HRIRs[1, 1, :] = pad(H_RR)
+
+    # Step 2: FFT for each HRIR
+    C_f = np.zeros((2, 2, N_fft), dtype=np.complex128)
+    for i in range(2):
+        for j in range(2):
+            C_f[i, j, :] = np.fft.fft(HRIRs[i, j, :])
+
+    # Step 3: Regularized inversion
+    H_f = np.zeros((2, 2, N_fft), dtype=np.complex128)
+    for k in range(N_fft):
+        C = C_f[:, :, k]
+        C_H = C.conj().T
+        H_f[:, :, k] = np.linalg.inv(C_H @ C + b * np.eye(2)) @ C_H
+
+    # Step 4: IFFT and fftshift
+    H_n = np.zeros((2, 2, N_fft))
+    for i in range(2):
+        for j in range(2):
+            h_time = np.fft.ifft(H_f[i, j, :]).real
+            H_n[i, j, :] = np.fft.fftshift(h_time)
+
+    # Step 5: Extract filters and apply window
+    def extract_window_center(h, N):
+        center = len(h) // 2
+        half = N // 2
+        extract = h[center - half:center + half]
+        return extract * np.hanning(N)
+
+    f11 = extract_window_center(H_n[0, 0, :], filter_length/2)
+    f12 = extract_window_center(H_n[0, 1, :], filter_length/2)
+    f21 = extract_window_center(H_n[1, 0, :], filter_length/2)
+    f22 = extract_window_center(H_n[1, 1, :], filter_length/2)
+
+    # Step 6: Apply relative delays based on geometry
+    if delay_compensation:
+        L_ear = head_position + np.array([-ear_offset / 2, 0.0])
+        R_ear = head_position + np.array([ ear_offset / 2, 0.0])
+
+        def delay_samples(spk, ear):
+            return int(round(np.linalg.norm(spk - ear) / c * samplerate))
+
+        delays = {
+            'f11': delay_samples(speaker_positions[0], L_ear),
+            'f12': delay_samples(speaker_positions[0], R_ear),
+            'f21': delay_samples(speaker_positions[1], L_ear),
+            'f22': delay_samples(speaker_positions[1], R_ear),
+        }
+
+        max_delay = max(delays.values())
+
+        def pad_delay(ir, actual, max_d):
+            return np.pad(ir, (max_d - actual, 0), mode='constant')[:filter_length]
+
+        f11 = pad_delay(f11, delays['f11'], max_delay)
+        f12 = pad_delay(f12, delays['f12'], max_delay)
+        f21 = pad_delay(f21, delays['f21'], max_delay)
+        f22 = pad_delay(f22, delays['f22'], max_delay)
+
+    print(f"[DEBUG] Max |f11| = {np.max(np.abs(f11)):.4f}, |f12| = {np.max(np.abs(f12)):.4f}, |f21| = {np.max(np.abs(f21)):.4f}, |f22| = {np.max(np.abs(f22)):.4f}")
+    return f11, f12, f21, f22
+
+def generate_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, filter_length, samplerate=48000, debug=False):
+    L = max(len(h_LL), len(h_LR), len(h_RL), len(h_RR))
+    # how many points? k is a hyperparameter. more points = more frequency domain precision at the expense of time domain precision.
+    M = filter_length
+    print("generate filter called")
+    N = 2**int(np.ceil(np.log2(L + M - 1)))
+    print("generate_filter: max length of H recordings:", L)
+    print("requested filter length: ", filter_length)
+    print("N: ", N)
+    print("M: ", M)
+
+    # compute H matrix in omega
+    H_ll = np.fft.fft(h_LL, n=N)
+    H_lr = np.fft.fft(h_LR, n=N)
+    H_rl = np.fft.fft(h_RL, n=N)
+    H_rr = np.fft.fft(h_RR, n=N)
+
+
+    delay_samples_l = int(np.round(np.linalg.norm(speaker_positions[0] - head_position) / 343.0 * samplerate))
+    delay_samples_r = int(np.round(np.linalg.norm(speaker_positions[1] - head_position) / 343.0 * samplerate))
+    if delay_samples_l == delay_samples_r:
+        print("Left and right sources are coherent, no delay applied")
+        tau_L = 0
+        tau_R = 0
+    elif delay_samples_l > delay_samples_r:
+        print("right source arrives first, applying delay to right")
+        tau_L = 0
+        tau_R = (delay_samples_l - delay_samples_r)/samplerate
+        print("applied {} seconds of delay to right".format(tau_R))
+    elif delay_samples_r > delay_samples_l:
+        print("left source arrives first, applying delay to left")
+        tau_L = (delay_samples_r - delay_samples_l)/samplerate
+        tau_R = 0
+        print("applied {} seconds of delay to left".format(tau_L))
+    
+    freqs = np.fft.fftfreq(N, d=1/samplerate)
+    omega = 2 * np.pi * freqs
+
+    exp_L = np.exp(1j * omega * tau_L)    # for the left speaker
+    exp_R = np.exp(1j * omega * tau_R)    # for the right speaker
+
+    H_ll = H_ll * exp_L
+    H_lr = H_lr * exp_R
+    H_rl = H_rl * exp_L
+    H_rr = H_rr * exp_R
+
+    # Closed-form 2×2 inversion per bin (small ε to avoid division by zero)
+    eps = 1e-12
+    det = H_ll * H_rr - H_lr * H_rl + eps
+
+    FLL =  H_rr / det
+    FLR = -H_lr / det
+    FRL = -H_rl / det
+    FRR =  H_ll / det
+
+    if debug:
+        # Plot magnitude spectra of HRTF, filter, HF product, and filter impulse responses
+        freqs = np.fft.fftfreq(N, d=1.0/samplerate)
+        positive = freqs[:N//2]
+        band = (positive >= 20) & (positive <= 20000)
+        
+        # Prepare H and F spectra lists
+        specs_H = [H_ll, H_lr, H_rl, H_rr]
+        specs_F = [F11, F12, F21, F22]
+        labels = ['11','12','21','22']
+
+        # Compute HF = H @ F per bin
+        H_freq = np.array([[H_ll, H_lr], [H_rl, H_rr]])
+        F_freq = np.array([[FLL, FLR], [FRL, FRR]])
+        HF = np.einsum('imk,mjk->ijk', H_freq, F_freq)
+        specs_HF = [HF[0,0,:], HF[0,1,:], HF[1,0,:], HF[1,1,:]]
+
+        # Compute raw time-domain IRs (unwindowed)
+        f_time = [np.fft.ifft(spec, n=N).real for spec in specs_F]
+        # time axis for full IRs
+        t_full = np.arange(N) / samplerate
+
+        # Create 4×4 grid
+        fig, axes = plt.subplots(4, 4, figsize=(18, 10))
+        for i in range(4):
+            # HRTF magnitude
+            axes[i,0].plot(positive[band], 20*np.log10(np.abs(specs_H[i][:N//2][band]) + 1e-12),
+                           label=f'H_{{{labels[i]}}}')
+            axes[i,0].set_ylabel('Mag (dB)')
+            axes[i,0].legend()
+            # Filter magnitude
+            axes[i,1].plot(positive[band], 20*np.log10(np.abs(specs_F[i][:N//2][band]) + 1e-12),
+                           label=f'F_{{{labels[i]}}}', linestyle='--')
+            axes[i,1].set_ylabel('Mag (dB)')
+            axes[i,1].legend()
+            # HF product magnitude
+            mag_HF = 20*np.log10(np.clip(np.abs(specs_HF[i][:N//2]), 1e-16, None))
+            axes[i,2].plot(positive, mag_HF, label=f"HF_{labels[i]}")
+            axes[i,2].set_ylabel('Mag (dB)')
+            axes[i,2].legend()
+            # Time-domain impulse response (full IR)
+            axes[i,3].plot(t_full, f_time[i], label=f'f_{{{labels[i]}}}(t)')
+            axes[i,3].set_ylabel('Amp')
+            axes[i,3].legend()
+        # Label bottom axes
+        for j, ax in enumerate(axes[3,:]):
+            ax.set_xlabel('Frequency (Hz)' if j < 3 else 'Time (s)')
+        fig.suptitle('HRTF vs. Filter vs. HF Product vs. Filter IRs')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
+
+    if debug:
+        # Verify HF ≈ I across frequency
+        H_freq = np.array([[H_ll, H_lr], [H_rl, H_rr]])
+        F_freq = np.array([[F11, F12], [F21, F22]])
+        HF = np.einsum('imk,mjk->ijk', H_freq, F_freq)
+        identity = np.eye(2)[:, :, None]
+
+        # Compute per-bin maximum deviation and report top 10 “bad” bins
+        dev = np.max(np.abs(HF - identity), axis=(0,1))          # shape (N,)
+        top_k = np.argsort(dev)[-10:][::-1]                      # indices of 10 largest
+        print("[DEBUG] Top 10 HF deviation bins:")
+        for k in top_k:
+            print(f"  bin {k}: deviation {dev[k]:.3e}")
+        # Report H matrix determinant and condition number at worst bins
+        print("[DEBUG] H matrix det and condition number at top deviation bins:")
+        # Only check HF on well-conditioned bins within 120–16 kHz
+        freqs = np.fft.fftfreq(N, d=1.0 / samplerate)
+        band_bins = (np.abs(freqs) >= 120) & (np.abs(freqs) <= 16000)
+        det = H_ll * H_rr - H_lr * H_rl
+        det_thresh = 1e-3 * np.max(np.abs(det))
+        good_bins = band_bins & (np.abs(det) > det_thresh)
+        for k in top_k:
+            Hk = np.array([[H_ll[k], H_lr[k]], [H_rl[k], H_rr[k]]])
+            svals = np.linalg.svd(Hk, compute_uv=False)
+            cond = svals[0] / svals[-1] if svals[-1] > 0 else np.inf
+            print(f"  bin {k}: det={det[k]:.3e}, cond={cond:.3e}, |H_ll|={abs(H_ll[k]):.3f}, |H_lr|={abs(H_lr[k]):.3f}")
+
+        max_dev = dev.max()
+        print(f"[DEBUG] generate_filter HF max deviation: {max_dev:.3e}")
+        # Compare only well-conditioned bins to the identity matrix (broadcast across bins)
+        assert np.allclose(HF[:,:,good_bins], identity, atol=1e-6), \
+            f"Frequency-domain HF check failed on well-conditioned bins (max deviation {max_dev:.3e})"
+
+    # Delay compensation
+    freqs = np.fft.fftfreq(N, d=1/samplerate)
+    omega = 2 * np.pi * freqs
+    # delay_samples_l = int(np.round((np.linalg.norm(speaker_positions[0] - head_position) / 343.0) * samplerate))
+    # delay_samples_r = int(np.round((np.linalg.norm(speaker_positions[1] - head_position) / 343.0) * samplerate))
+    # I was previously rolling by the delay, but this is not correct.
+    # Now I'm rolling by a static delay of 200 samples to prevent non-causality.
+    delay_samples_l = -400
+    delay_samples_r = -400
+
+    tau_L = delay_samples_l / samplerate
+    tau_R = delay_samples_r / samplerate
+    exp_L = np.exp(1j * omega * tau_L)    # for the left speaker
+    exp_R = np.exp(1j * omega * tau_R)    # for the right speaker
+
+    FLL *= exp_L
+    FLR *= exp_R
+    FRL *= exp_L
+    FRR *= exp_R
+
+    HLL_comp = H_ll * exp_L
+    HLR_comp = H_lr * exp_R
+    HRL_comp = H_rl * exp_L
+    HRR_comp = H_rr * exp_R
+
+    fll = np.fft.ifft(FLL, n=N).real
+    flr = np.fft.ifft(FLR, n=N).real
+    frl = np.fft.ifft(FRL, n=N).real
+    frr = np.fft.ifft(FRR, n=N).real
+
+    # Step 4: window IRs to half filter_length, then roll delays
+    def window_and_trim(ir, delay_samples=None):
+        # 1) Truncate or pad ir to exactly filter_length
+        if len(ir) < filter_length:
+            ir2 = np.pad(ir, (0, filter_length - len(ir)), mode='constant')
+        else:
+            ir2 = ir[:filter_length]
+
+        # 2) Build a full-length window, with a Hann bump of width half = filter_length//2
+        win = np.zeros(filter_length)
+        half = filter_length // 2
+        hann = np.hanning(half)
+
+        # 3) Compute where to start placing the Hann bump so its center is at delay_samples
+        #    The Hann window's center index is half//2
+        if delay_samples is None:
+            start = 0
+        else:
+            start = delay_samples - (half // 2)
+
+        # 4) Fill the bump into win, clipping to [0,filter_length)
+        for i in range(half):
+            idx = start + i
+            if 0 <= idx < filter_length:
+                win[idx] = hann[i]
+
+        # 5) Apply
+        return ir2 * win
+
+    if debug:
+        # Frequency axis (positive half)
+        freqs = np.fft.fftfreq(N, d=1.0/samplerate)
+        positive = freqs[:N//2]
+
+        # Spectra of delayed H matrix
+        specs_H_comp = [HLL_comp, HLR_comp, HRL_comp, HRR_comp]
+        # Spectra of embedded-delay filters
+        specs_F = [F11, F12, F21, F22]
+
+        # Compute HF = H_comp @ F per bin
+        H_freq_comp = np.array([[HLL_comp, HLR_comp],
+                                [HRL_comp, HRR_comp]])
+        F_freq = np.array([[F11, F12],
+                           [F21, F22]])
+        HF = np.einsum('imk,mjk->ijk', H_freq_comp, F_freq)
+        specs_HF = [HF[0,0,:], HF[0,1,:], HF[1,0,:], HF[1,1,:]]
+
+        # Time-domain IRs
+        f_time = [f11, f12, f21, f22]
+        t = np.arange(len(f11)) / samplerate
+
+        labels = ['LL','LR','RL','RR']
+        fig, axes = plt.subplots(4, 4, figsize=(18, 10))
+        for i in range(4):
+            # H spectrum
+            axes[i,0].plot(positive, 20*np.log10(np.abs(specs_H_comp[i][:N//2]) + 1e-12),
+                           label=f'H_{labels[i]}')
+            axes[i,0].set_ylabel('Mag (dB)')
+            axes[i,0].legend()
+            # F spectrum
+            axes[i,1].plot(positive, 20*np.log10(np.abs(specs_F[i][:N//2]) + 1e-12),
+                           label=f'F_{labels[i]}', linestyle='--')
+            axes[i,1].set_ylabel('Mag (dB)')
+            axes[i,1].legend()
+            # HF spectrum
+            axes[i,2].plot(positive, 20*np.log10(np.abs(specs_HF[i][:N//2]) + 1e-12),
+                           label=f'HF_{labels[i]}', linestyle='-.')
+            axes[i,2].set_ylabel('Mag (dB)')
+            axes[i,2].legend()
+            # Impulse response
+            axes[i,3].plot(t, f_time[i], label=f'f_{labels[i]}(t)')
+            axes[i,3].set_ylabel('Amp')
+            axes[i,3].legend()
+            # X-axis labels
+            for col in range(4):
+                if i == 3:
+                    axes[i,col].set_xlabel('Freq (Hz)' if col < 3 else 'Time (s)')
+        fig.suptitle('Delayed H, Embedded-Delay F, HF Product, and Filter IRs')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
+
+    return fll, flr, frl, frr
+
+
+def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position, speaker_positions, ear_offset=0.15, regularization=None, filter_length=4096, delay_compensation=True):
     c = 343.0  # speed of sound (m/s)
 
     # Step 1: Align HRIRs to center
-    H_LL, H_LR, H_RL, H_RR = align_impulse_responses(H_LL, H_LR, H_RL, H_RR)
+    # H_LL, H_LR, H_RL, H_RR = align_impulse_responses(H_LL=H_LL, H_LR=H_LR, H_RL=H_RL, H_RR=H_RR)
+
+    # A reminder!
+    # HRIR_LL = left ear left speaker
+    # HRIR_LR = left ear right speaker
+    # HRIR_RL = right ear left speaker
+    # HRIR_RR = right ear right speaker
 
     L = max(len(H_LL), len(H_LR), len(H_RL), len(H_RR))
     N_fft = 2**int(np.ceil(np.log2(L)))
 
+    print("generate_xtc_filters_mimo: max length of H recordings:", L)
+    print("requested filter length: ", filter_length)
+    
     # Step 2: FFT of IRs
     h_ll = np.fft.fft(H_LL, n=N_fft)
     h_lr = np.fft.fft(H_LR, n=N_fft)
@@ -556,27 +923,28 @@ def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position,
     h_rr = np.fft.fft(H_RR, n=N_fft)
 
     # Step 3: Setup Regularization
-    freqs = np.abs(np.fft.fftfreq(N_fft, d=1.0 / samplerate))
-    if regularization is None:
-        # Strong regularization at low freq, weak at high freq
-        eps_low = 1e-2   # Regularization below 500 Hz
-        eps_high = 1e-6  # Regularization above 5 kHz
+    # freqs = np.abs(np.fft.fftfreq(N_fft, d=1.0 / samplerate))
+    # if regularization is None:
+    #     eps_low = 1e-2
+    #     eps_high = 1e-6
+    #     f_low = 500.0
+    #     f_high = 5000.0
 
-        f_low = 500.0
-        f_high = 5000.0
+    #     eps_array = np.zeros_like(freqs)
+    #     log_eps_low = np.log10(eps_low)
+    #     log_eps_high = np.log10(eps_high)
 
-        eps_array = np.zeros_like(freqs)
-
-        for i, f in enumerate(freqs):
-            if f < f_low:
-                eps_array[i] = eps_low
-            elif f > f_high:
-                eps_array[i] = eps_high
-            else:
-                # Linear interpolation between low and high
-                eps_array[i] = eps_low + (eps_high - eps_low) * (f - f_low) / (f_high - f_low)
-    else:
-        raise ValueError("Regularization must be a callable or None.")
+    #     for i, f in enumerate(freqs):
+    #         if f < f_low:
+    #             eps_array[i] = 10**log_eps_low
+    #         elif f > f_high:
+    #             eps_array[i] = 10**log_eps_high
+    #         else:
+    #             alpha = (np.log10(f + 1e-9) - np.log10(f_low)) / (np.log10(f_high) - np.log10(f_low))
+    #             log_eps = (1 - alpha) * log_eps_low + alpha * log_eps_high
+    #             eps_array[i] = 10**log_eps
+    # else:
+    #     raise ValueError("Regularization must be a callable or None.")
     
     # Step 4: Invert per frequency bin
     F11_freq = np.zeros(N_fft, dtype=np.complex128)
@@ -586,10 +954,10 @@ def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position,
 
     for k in range(N_fft):
         M = np.array([[h_ll[k], h_lr[k]],
-                      [h_rl[k], h_rr[k]]])
+                    [h_rl[k], h_rr[k]]])
 
         M_conjT = np.conj(M.T)
-        M_reg = M_conjT @ M + eps_array[k] * np.eye(2)  # Tikhonov regularization
+        M_reg = M_conjT @ M + eps_array[k] * np.eye(2)
 
         Minv = np.linalg.inv(M_reg) @ M_conjT
 
@@ -602,34 +970,6 @@ def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position,
     f21_time = np.fft.ifft(F21_freq).real
     f22_time = np.fft.ifft(F22_freq).real
 
-    # Step 6: Apply sweet spot delays
-    L_ear = head_position + np.array([-ear_offset/2, 0.0])
-    R_ear = head_position + np.array([ ear_offset/2, 0.0])
-
-    def calc_delay_samples(spk_pos, ear_pos):
-        distance = np.linalg.norm(spk_pos - ear_pos)
-        time = distance / c
-        delay_samples = int(round(time * samplerate))
-        return delay_samples
-
-    # Compute relative delays
-    delay_LL = calc_delay_samples(speaker_positions[0], L_ear)
-    delay_LR = calc_delay_samples(speaker_positions[0], R_ear)
-    delay_RL = calc_delay_samples(speaker_positions[1], L_ear)
-    delay_RR = calc_delay_samples(speaker_positions[1], R_ear)
-
-    max_delay = max(delay_LL, delay_LR, delay_RL, delay_RR)
-
-    def delay_pad(ir, delay, max_delay):
-        pre_pad = max_delay - delay
-        return np.pad(ir, (pre_pad, 0), mode='constant')
-
-    f11_time = delay_pad(f11_time, delay_LL, max_delay)
-    f12_time = delay_pad(f12_time, delay_LR, max_delay)
-    f21_time = delay_pad(f21_time, delay_RL, max_delay)
-    f22_time = delay_pad(f22_time, delay_RR, max_delay)
-
-    # Step 7: Truncate and window
     def window_and_trim(ir, target_length):
         if len(ir) < target_length:
             ir = np.pad(ir, (0, target_length - len(ir)))
@@ -643,7 +983,268 @@ def generate_xtc_filters_mimo(H_LL, H_LR, H_RL, H_RR, samplerate, head_position,
     f21_time = window_and_trim(f21_time, filter_length)
     f22_time = window_and_trim(f22_time, filter_length)
 
+    # Frequency-domain inversion check: H(ω) @ F(ω)^T ≈ I for each frequency bin
+    H_freq = np.array([[h_ll, h_lr], [h_rl, h_rr]])
+    F_freq = np.array([[F11_freq, F12_freq], [F21_freq, F22_freq]])
+    # Compute H * F^T over all frequency bins: HFt[i,j,k] = Σ_m H_freq[i,m,k] * F_freq[j,m,k]
+    HFt = np.einsum('imk,jmk->ijk', H_freq, F_freq)
+    # Broadcast identity matrix across frequency bins
+
+    print("HFt shape: ", HFt.shape)
+    identity = np.eye(2)[:, :, None]
+    assert np.allclose(HFt, identity, atol=1e-6), "Frequency-domain inversion check failed"
+
+
+    assert f11_time.shape == (filter_length,)
+    assert f12_time.shape == (filter_length,)
+    assert f21_time.shape == (filter_length,)
+    assert f22_time.shape == (filter_length,)
+    print("Passed shape assertions")
+
+    
     return f11_time, f12_time, f21_time, f22_time
+
+def generate_xtc_filters_mimo_rls(H_LL, H_LR, H_RL, H_RR, samplerate, head_position, speaker_positions, ear_offset=0.15, regularization=None, filter_length=4096):
+    """
+    Adaptive Least-Squares XTC filter design following Mouchtaris et al.
+
+    Parameters match previous function for compatibility.
+    """
+
+    c = 343.0  # Speed of sound in m/s
+
+    # Step 1: Align HRIRs
+    H_LL, H_LR, H_RL, H_RR = align_impulse_responses(H_LL, H_LR, H_RL, H_RR)
+
+    # Step 2: Zero-pad HRIRs
+    def pad(ir, target_len):
+        if len(ir) < target_len:
+            return np.pad(ir, (0, target_len - len(ir)))
+        else:
+            return ir[:target_len]
+
+    H_LL = pad(H_LL, filter_length)
+    H_LR = pad(H_LR, filter_length)
+    H_RL = pad(H_RL, filter_length)
+    H_RR = pad(H_RR, filter_length)
+
+    # Step 3: Build convolution matrices
+    from scipy.linalg import toeplitz
+
+    def build_toeplitz(signal, num_taps):
+        col = np.concatenate(([signal[0]], np.zeros(num_taps-1)))
+        row = signal[:num_taps]
+        return toeplitz(col, row)
+
+    T_LL = build_toeplitz(H_LL, filter_length)
+    T_LR = build_toeplitz(H_LR, filter_length)
+    T_RL = build_toeplitz(H_RL, filter_length)
+    T_RR = build_toeplitz(H_RR, filter_length)
+
+    # Step 4: Build system matrix A and desired response vector d
+    A = np.block([
+        [T_LL, T_LR, np.zeros_like(T_LL), np.zeros_like(T_LR)],
+        [np.zeros_like(T_RL), np.zeros_like(T_RR), T_RL, T_RR]
+    ])  # Shape: (2*filter_length, 4*filter_length)
+
+    d = np.zeros(2*filter_length)
+    d[:filter_length] = 1.0  # Left ear response: 1
+    d[filter_length:] = 1.0  # Right ear response: 1
+
+    # Step 5: Solve weighted least-squares problem
+    lambda_reg = 1e-4
+    ATA = A.T @ A + lambda_reg * np.eye(4*filter_length)
+    ATd = A.T @ d
+    filters = np.linalg.solve(ATA, ATd)
+
+    # Step 6: Extract filters
+    f11 = filters[:filter_length]
+    f12 = filters[filter_length:2*filter_length]
+    f21 = filters[2*filter_length:3*filter_length]
+    f22 = filters[3*filter_length:]
+
+    # Step 7: Window and output
+    def window_and_trim(ir, target_len):
+        if len(ir) < target_len:
+            ir = np.pad(ir, (0, target_len - len(ir)))
+        elif len(ir) > target_len:
+            ir = ir[:target_len]
+        window = np.hanning(target_len)
+        return ir * window
+
+    f11 = window_and_trim(f11, filter_length)
+    f12 = window_and_trim(f12, filter_length)
+    f21 = window_and_trim(f21, filter_length)
+    f22 = window_and_trim(f22, filter_length)
+
+    print(f"Max f11 (L->L): {np.max(np.abs(f11))}")
+    print(f"Max f12 (L->R): {np.max(np.abs(f12))}")
+    print(f"Max f21 (R->L): {np.max(np.abs(f21))}")
+    print(f"Max f22 (R->R): {np.max(np.abs(f22))}")
+
+    return f11, f12, f21, f22
+
+def generate_xtc_filters_mimo_hybrid(
+    H_LL, H_LR, H_RL, H_RR,
+    samplerate, head_position, speaker_positions,
+    ear_offset=0.15, regularization=None,
+    filter_length=4096, num_iterations=10, fft_bins=1024
+):    
+    """
+    Hybrid XTC filter design combining time-domain contralateral cancellation and
+    frequency-domain flatness optimization.
+
+    Steps:
+    1. Align HRIRs using align_impulse_responses.
+    2. Pad HRIRs to the target filter_length.
+    3. Build convolution matrices and construct system matrix A and target vector d
+       for time-domain contralateral cancellation.
+    4. Solve the weighted least-squares problem to obtain initial filters.
+    5. Perform FFT of the resulting filters.
+    6. Define a flatness penalty that penalizes deviation of FFT magnitude from 1.0
+       in ipsilateral filters (f11 and f22).
+    7. Define a hybrid cost: time-domain contralateral energy + 0.001 * frequency-domain flatness error.
+    8. Iteratively re-solve the least-squares problem (5 iterations) to improve frequency flatness.
+    9. Extract f11, f12, f21, f22 and apply a Hanning window and trim to filter_length.
+    10. Print debug information: maximum values of f11, f12, f21, f22.
+    """
+    import numpy as np
+    from scipy.linalg import toeplitz
+    print("Generating XTC filters using hybrid optimization...")
+    c = 343.0  # speed of sound in m/s
+
+    # Step 1: Align HRIRs
+    H_LL, H_LR, H_RL, H_RR = align_impulse_responses(H_LL, H_LR, H_RL, H_RR)
+    print("HRIRs aligned.")
+    # Step 2: Pad HRIRs to target filter_length
+    def pad(ir, target_len):
+        if len(ir) < target_len:
+            return np.pad(ir, (0, target_len - len(ir)))
+        else:
+            return ir[:target_len]
+
+    H_LL = pad(H_LL, filter_length)
+    H_LR = pad(H_LR, filter_length)
+    H_RL = pad(H_RL, filter_length)
+    H_RR = pad(H_RR, filter_length)
+
+    # Step 3: Build convolution (Toeplitz) matrices for each HRIR
+    def build_toeplitz(signal, num_taps):
+        col = np.concatenate(([signal[0]], np.zeros(num_taps - 1)))
+        row = signal[:num_taps]
+        return toeplitz(col, row)
+
+    print("Building convolution matrices...")
+    T_LL = build_toeplitz(H_LL, filter_length)
+    T_LR = build_toeplitz(H_LR, filter_length)
+    T_RL = build_toeplitz(H_RL, filter_length)
+    T_RR = build_toeplitz(H_RR, filter_length)
+
+    print("Building system matrix A and desired response vector d...")
+    # Step 4: Build system matrix A and desired response vector d
+    A = np.block([
+        [T_LL, T_LR, np.zeros_like(T_LL), np.zeros_like(T_LR)],
+        [np.zeros_like(T_RL), np.zeros_like(T_RR), T_RL, T_RR]
+    ])
+
+    d = np.zeros(2 * filter_length)
+
+    # Calculate correct impulse delays based on head position
+    c = 343.0  # speed of sound
+    L_ear = head_position + np.array([-ear_offset / 2, 0.0])
+    R_ear = head_position + np.array([ear_offset / 2, 0.0])
+
+    def compute_delay_samples(speaker_pos, ear_pos):
+        distance = np.linalg.norm(speaker_pos - ear_pos)
+        delay_sec = distance / c
+        delay_samples = int(round(delay_sec * samplerate))
+        return delay_samples
+
+    delay_LL = compute_delay_samples(speaker_positions[0], L_ear)
+    delay_RR = compute_delay_samples(speaker_positions[1], R_ear)
+
+    if delay_LL < filter_length:
+        d[delay_LL] = 1.0
+    if delay_RR < filter_length:
+        d[filter_length + delay_RR] = 1.0
+
+    print("System matrix A and target vector d built.")
+    print("Regularization for time-domain LS...")
+    # Regularization for time-domain LS
+    lambda_reg = 1e-4
+    ATA = A.T @ A + lambda_reg * np.eye(4 * filter_length)
+    ATd = A.T @ d
+    AT = A.T
+    errors = []
+    # Step 5: Solve initial least-squares problem
+    from scipy.linalg import cho_factor, cho_solve
+
+    lambda_reg = 1e-4
+    ATA = A.T @ A + lambda_reg * np.eye(4 * filter_length)
+    ATd = A.T @ d
+
+    # Precompute Cholesky
+    c_factor = cho_factor(ATA)
+
+    # Solve once initially
+    filters = cho_solve(c_factor, ATd)
+    # Extract initial filters
+    f11 = filters[:filter_length]
+    f12 = filters[filter_length:2 * filter_length]
+    f21 = filters[2 * filter_length:3 * filter_length]
+    f22 = filters[3 * filter_length:]
+
+    # Step 6 & 7: Iterative re-optimization with hybrid cost (time-domain error + flatness penalty)
+    weight_flatness = 0.001
+    num_iterations = 5
+    for iteration in range(num_iterations):
+        # FFTs for ipsilateral filters
+        F11 = np.fft.fft(f11, n=fft_bins)
+        F22 = np.fft.fft(f22, n=fft_bins)
+
+        # Flatness penalties
+        flatness_error_F11 = np.abs(np.abs(F11) - 1.0)
+        flatness_error_F22 = np.abs(np.abs(F22) - 1.0)
+        flatness_penalty = weight_flatness * (np.mean(flatness_error_F11) + np.mean(flatness_error_F22))
+
+        errors.append(flatness_penalty)
+
+        # Update ATd slightly instead of d itself
+        ATd_hybrid = ATd - flatness_penalty * np.ones_like(ATd)
+        filters = cho_solve(c_factor, ATd_hybrid)
+
+        # Update filters
+        f11 = filters[:filter_length]
+        f12 = filters[filter_length:2 * filter_length]
+        f21 = filters[2 * filter_length:3 * filter_length]
+        f22 = filters[3 * filter_length:]
+        # Print progress bar
+        bar_len = 30
+        filled_len = int(bar_len * (iteration + 1) / num_iterations)
+        bar = '#' * filled_len + '-' * (bar_len - filled_len)
+        print(f"\r[{bar}] {100*(iteration+1)//num_iterations}% Iter {iteration+1}/{num_iterations} | Error: {flatness_penalty:.6f}", end='')
+    print("\nOptimization complete.")
+    # Step 8: Apply Hanning window and trim to filter_length
+    def window_and_trim(ir, target_len):
+        if len(ir) < target_len:
+            ir = np.pad(ir, (0, target_len - len(ir)))
+        elif len(ir) > target_len:
+            ir = ir[:target_len]
+        window = np.hanning(target_len)
+        return ir * window
+
+    f11 = window_and_trim(f11, filter_length)
+    f12 = window_and_trim(f12, filter_length)
+    f21 = window_and_trim(f21, filter_length)
+    f22 = window_and_trim(f22, filter_length)
+
+    # Step 9: Debug prints for filter maxima
+    print(f"Hybrid Optimization Debug: Max f11: {np.max(np.abs(f11))}")
+    print(f"Hybrid Optimization Debug: Max f12: {np.max(np.abs(f12))}")
+    print(f"Hybrid Optimization Debug: Max f21: {np.max(np.abs(f21))}")
+    print(f"Hybrid Optimization Debug: Max f22: {np.max(np.abs(f22))}")
+
+    return f11, f12, f21, f22
 
 def plot_ir(ir_data, samplerate, title):
     """
@@ -1064,9 +1665,8 @@ def main():
             tolerance = float(input("Enter azimuth tolerance (degrees): "))
             check_symmetric_angles(sofa_file, left_az, right_az, tolerance)
         elif choice == "3":
-            data = extract_4_ir_sofa(sofa_file, left_az=-30.0, right_az=30.0)
-            visualize_4_ir(data)
-            plot_hrtf_smaart_style(data, data["samplerate"], azimuth=0)
+            h_ll, h_lr = extract_hrirs_sam(sofa_file, -30, True)
+            h_rl, h_rr = extract_hrirs_sam(sofa_file, 30, True)
         elif choice == "4":
             print("Entering record mode...")
             recordHRTF()

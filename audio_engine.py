@@ -7,7 +7,7 @@ class AudioEngine:
         self.config = config
         self.meter_callback = meter_callback
         self.streams = []
-        self.levels = [0.0] * 5  # In L, In R, Mic, Out L, Out R
+        self.levels = [0.0] * 4  # In L, In R, Out L, Out R
         self.f11 = f11
         self.f12 = f12
         self.f21 = f21
@@ -46,19 +46,19 @@ class AudioEngine:
             self.streams.append(self.binaural_stream)
 
             # Mic input (1ch)
-            print("Starting mic input stream on:", self.config["measurement_device"])
-            index = self._find_device_index(self.config["measurement_device"])
-            self.mic_stream = sd.InputStream(
-                device=index,
-                channels=1,
-                dtype='float32',
-                samplerate=48000,
-                callback=self._mic_callback,
-                latency='low',
-                blocksize=512
-            )
-            self.mic_stream.start()
-            self.streams.append(self.mic_stream)
+            # print("Starting mic input stream on:", self.config["measurement_device"])
+            # index = self._find_device_index(self.config["measurement_device"])
+            # self.mic_stream = sd.InputStream(
+            #     device=index,
+            #     channels=1,
+            #     dtype='float32',
+            #     samplerate=48000,
+            #     callback=self._mic_callback,
+            #     latency='low',
+            #     blocksize=512
+            # )
+            # self.mic_stream.start()
+            # self.streams.append(self.mic_stream)
 
             print("Starting output stream on:", self.config["playback_device"])
             index = self._find_device_index(self.config["playback_device"])
@@ -84,16 +84,17 @@ class AudioEngine:
         rms = np.sqrt(np.mean(indata**2, axis=0))
         self.levels[0] = float(rms[0])
         self.levels[1] = float(rms[1])
+
     def _mic_callback(self, indata, frames, time, status):
         if status:
             print("Mic input stream status:", status)
         # print(f"Mic callback: indata shape {indata.shape}, RMS={np.sqrt(np.mean(indata**2)):.4f}")
         rms = np.sqrt(np.mean(indata**2))
-        self.levels[2] = float(rms)
+        #self.levels[2] = float(rms)
 
     def _update_meters(self):
         normed = []
-        for i in range(5):
+        for i in range(4):
             db = 20 * np.log10(self.levels[i] + 1e-9)
             norm = min(max((db + 60) / 60.0, 0.0), 1.0)
             normed.append(norm)
@@ -117,9 +118,7 @@ class AudioEngine:
 
         try:
             if self.bypass:
-                # Direct passthrough (bypass mode)
-                sig_L = self.latest_binaural_block[:, 0]
-                sig_R = self.latest_binaural_block[:, 1]
+                outdata[:] = self.latest_binaural_block.copy()  # Direct passthrough (bypass mode)
             else:
                 left = self.latest_binaural_block[:, 0]
                 right = self.latest_binaural_block[:, 1]
@@ -132,8 +131,8 @@ class AudioEngine:
                 outdata[:, 1] = sig_R
 
                 # Optional metering for output (not yet implemented)
-                self.levels[3] = np.sqrt(np.mean(sig_L**2))
-                self.levels[4] = np.sqrt(np.mean(sig_R**2))
+                self.levels[2] = np.sqrt(np.mean(sig_L**2))
+                self.levels[3] = np.sqrt(np.mean(sig_R**2))
 
         except Exception as e:
             print("Error in output processing:", e)
