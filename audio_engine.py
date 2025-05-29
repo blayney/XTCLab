@@ -1,3 +1,4 @@
+from scipy.signal import butter, sosfilt, sosfilt_zi, oaconvolve
 import numpy as np
 import sounddevice as sd
 from PyQt6.QtCore import QTimer
@@ -13,11 +14,21 @@ class AudioEngine:
         self.f21 = f21
         self.f22 = f22
         self.latest_binaural_block = None
+        self.latest_output_block = None
         self.timer = QTimer()
         self.timer.timeout.connect(self._update_meters)
         self.timer.start(30)
         print("AudioEngine initialized with config:", self.config)
         self.bypass = bypass
+        # Design causal IIR crossover filters at 80 Hz (4th-order Butterworth)
+        fs = 48000.0
+        self.sos_hp = butter(4, 80.0, btype='high', fs=fs, output='sos')
+        self.sos_lp = butter(4, 80.0, btype='low',  fs=fs, output='sos')
+        # Initialize per-channel filter state for streaming sosfilt
+        self.zlp_L = sosfilt_zi(self.sos_lp)
+        self.zlp_R = sosfilt_zi(self.sos_lp)
+        self.zhp_L = sosfilt_zi(self.sos_hp)
+        self.zhp_R = sosfilt_zi(self.sos_hp)
  
         self._setup_streams()
 
@@ -66,7 +77,7 @@ class AudioEngine:
                 device=index,
                 channels=2,
                 samplerate=48000,
-                callback=self._output_callback,
+                callback=self._output_callback
             )
             self.out_stream.start()
             self.streams.append(self.out_stream)
@@ -84,6 +95,7 @@ class AudioEngine:
         rms = np.sqrt(np.mean(indata**2, axis=0))
         self.levels[0] = float(rms[0])
         self.levels[1] = float(rms[1])
+        # Removed immediate meter update; QTimer will drive updates
 
     def _mic_callback(self, indata, frames, time, status):
         if status:
@@ -119,20 +131,54 @@ class AudioEngine:
         try:
             if self.bypass:
                 outdata[:] = self.latest_binaural_block.copy()  # Direct passthrough (bypass mode)
+                # Store the bypassed output block for FFT display
+                self.latest_output_block = outdata.copy()
+                # Compute real output levels from bypassed data
+                rms_out = np.sqrt(np.mean(outdata**2, axis=0))
+                self.levels[2] = float(rms_out[0])
+                self.levels[3] = float(rms_out[1])
+                # Removed immediate meter update; QTimer will drive updates
             else:
+                # 1) XTC‑filtered full‑band signals
                 left = self.latest_binaural_block[:, 0]
                 right = self.latest_binaural_block[:, 1]
-                sig_L = np.convolve(left, self.f11, mode='same') + np.convolve(right, self.f12, mode='same')
-                sig_R = np.convolve(left, self.f21, mode='same') + np.convolve(right, self.f22, mode='same')
+                # Partitioned overlap-add convolution
+                sig_L = oaconvolve(left, self.f11, mode='same') + oaconvolve(right, self.f12, mode='same')
+                sig_R = oaconvolve(left, self.f21, mode='same') + oaconvolve(right, self.f22, mode='same')
 
-                sig_L = sig_L[:frames] if len(sig_L) >= frames else np.pad(sig_L, (0, frames - len(sig_L)))
-                sig_R = sig_R[:frames] if len(sig_R) >= frames else np.pad(sig_R, (0, frames - len(sig_R)))
-                outdata[:, 0] = sig_L
-                outdata[:, 1] = sig_R
+                # 2) Causal IIR crossover: low-pass direct + high-pass filtered, streaming
+                sig_lp_L, self.zlp_L = sosfilt(self.sos_lp, left,  zi=self.zlp_L)
+                sig_lp_R, self.zlp_R = sosfilt(self.sos_lp, right, zi=self.zlp_R)
+                sig_hp_L, self.zhp_L = sosfilt(self.sos_hp, sig_L,   zi=self.zhp_L)
+                sig_hp_R, self.zhp_R = sosfilt(self.sos_hp, sig_R,   zi=self.zhp_R)
 
-                # Optional metering for output (not yet implemented)
-                self.levels[2] = np.sqrt(np.mean(sig_L**2))
-                self.levels[3] = np.sqrt(np.mean(sig_R**2))
+                # 3) Ensure each branch matches block length
+                out_L = sig_lp_L[:frames] if len(sig_lp_L) >= frames else np.pad(sig_lp_L, (0, frames-len(sig_lp_L)))
+                out_R = sig_lp_R[:frames] if len(sig_lp_R) >= frames else np.pad(sig_lp_R, (0, frames-len(sig_lp_R)))
+                out_L += sig_hp_L[:frames] if len(sig_hp_L) >= frames else np.pad(sig_hp_L, (0, frames-len(sig_hp_L)))
+                out_R += sig_hp_R[:frames] if len(sig_hp_R) >= frames else np.pad(sig_hp_R, (0, frames-len(sig_hp_R)))
 
+                # 4) Prevent clipping
+                np.clip(np.vstack((out_L, out_R)).T, -1.0, 1.0, out=outdata)
+
+                # 5) Store for FFT display and metering
+                self.latest_output_block = outdata.copy()
+                self.levels[2] = np.sqrt(np.mean(outdata[:,0]**2))
+                self.levels[3] = np.sqrt(np.mean(outdata[:,1]**2))
+                # Removed immediate meter update; QTimer will drive updates
         except Exception as e:
             print("Error in output processing:", e)
+
+    def close(self):
+        """Stop and close all audio streams."""
+        for stream in getattr(self, "streams", []):
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        self.streams = []
+
+    def set_bypass(self, bypass: bool):
+        """Enable or disable filter bypass without restarting streams."""
+        self.bypass = bypass

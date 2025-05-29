@@ -6,8 +6,5 @@ You can also recalculate new virtual HRTFs and XTC filters with the head anywher
 
 Finally, the simulator includes an energy distribution calculator, which computes the relative contralateral energy reduction for each point in the 4m x 4m virtual space around the ideal position, showing how the filter's resulting interference pattern radiates out from the speakers, and develops as you move away from the sweet spot. It's also interesting to see how the regularisation factor impacts this interference pattern.
 
-Here's a screenshot of the most up to date version
-![Screenshot 2025-05-06 at 13 03 36](https://github.com/user-attachments/assets/e10810bc-698d-4952-926a-847c00873da8)
-
 <img width="1450" alt="Screenshot 2025-03-31 at 15 43 36" src="https://github.com/user-attachments/assets/21f6d868-ba4d-4f03-b778-10f10a984479" />
 <img width="1450" alt="Screenshot 2025-01-14 at 17 06 15" src="https://github.com/user-attachments/assets/4dd0ba8a-4d6c-474b-b1a0-6d53c5aeabe3" />

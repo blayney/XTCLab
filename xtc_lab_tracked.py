@@ -63,20 +63,19 @@ def xtc_lab_processor():
     # ----------------------------------------------------
     # Geometry & Setup
     # ----------------------------------------------------
-    distance = 1.5
+    distance_l = 1.5
+    distance_r = 2
     left_az_deg = -30.0
-    right_az_deg = 30.0
+    right_az_deg = 10.0
 
-    head_position = np.array([0.0, 1.0])
-    ideal_position = np.array([0.0, 1.0])
-    ear_offset = 0.15
+    head_position = np.array([1.0, 2.0])
     scale_factor = 100.0
     c = 343.0  # Speed of sound
 
-    xL = head_position[0] + distance * sin(radians(left_az_deg))
-    yL = head_position[1] + distance * cos(radians(left_az_deg))
-    xR = head_position[0] + distance * sin(radians(right_az_deg))
-    yR = head_position[1] + distance * cos(radians(right_az_deg))
+    xL = head_position[0] + distance_l * sin(radians(left_az_deg))
+    yL = head_position[1] + distance_l * cos(radians(left_az_deg))
+    xR = head_position[0] + distance_r * sin(radians(right_az_deg))
+    yR = head_position[1] + distance_r * cos(radians(right_az_deg))
 
     # This is structured as follows:
     #   [[xL, yL],  # Left Speaker
@@ -118,6 +117,13 @@ def xtc_lab_processor():
             self.hlr = None
             self.hrl = None
             self.hrr = None
+
+            self.FLL = None
+            self.FLR = None
+            self.FRL = None
+            self.FRR = None
+
+            self.head_rotation = 0
 
             self.fll = None
             self.flr = None
@@ -251,7 +257,7 @@ def xtc_lab_processor():
                 
             self.plot = DraggablePlot(title="Geometric View")
             self.plot.setAspectLocked(True)
-            # set minimum width of the plot
+            # set minimum width of the plotf
             self.plot.setMinimumWidth(500)
 
             # set the plot to have it's grid enabled by default
@@ -269,6 +275,49 @@ def xtc_lab_processor():
             )
             self.speaker_marker.setData(spk_x, spk_y)
             self.plot.addItem(self.speaker_marker)
+
+            # --- Hover panel for speaker-filter FFT chains as floating widget ---
+            from PyQt6.QtGui import QCursor
+            from PyQt6.QtCore import QPoint
+            self.hover_panel = QtWidgets.QWidget(self, flags=Qt.WindowType.ToolTip)
+            grid = QtWidgets.QGridLayout(self.hover_panel)
+            # reduce padding around the grid
+            grid.setContentsMargins(5, 5, 5, 5)
+            # Real-time input FFTs
+            self.hover_plot_input_L = pg.PlotWidget(title="Input FFT L", showGrid=True, showAxis=False, pen=pg.mkPen('b', width=2))
+            self.hover_plot_input_R = pg.PlotWidget(title="Input FFT R", showGrid=True, showAxis=False, pen=pg.mkPen('r', width=2))
+            # Filter IR FFTs placeholders
+            self.hover_plot_filter1 = pg.PlotWidget(title="Filter FFT 1", showGrid=True, showAxis=False, pen=pg.mkPen('g', width=2))
+            self.hover_plot_filter2 = pg.PlotWidget(title="Filter FFT 2", showGrid=True, showAxis=False, pen=pg.mkPen('g', width=2))
+            # Output FFT placeholder
+            self.hover_plot_output = pg.PlotWidget(title="Output FFT", showGrid=True, showAxis=False)
+            # Scale down all hover plots
+            for pw in (self.hover_plot_input_L, self.hover_plot_input_R,
+                       self.hover_plot_filter1, self.hover_plot_filter2,
+                       self.hover_plot_output):
+                pw.setFixedSize(150, 100)
+                pw.showGrid(x=True, y=True)
+                pw.showAxis('bottom', show=False)
+                pw.showAxis('left', show=False)
+            # Layout: two rows, five columns: input, arrow, filter, sum/output
+            grid.addWidget(self.hover_plot_input_L, 0, 0)
+            grid.addWidget(QtWidgets.QLabel("→"), 0, 1)
+            grid.addWidget(self.hover_plot_filter1, 0, 2)
+            grid.addWidget(QtWidgets.QLabel("∑"), 0, 3)
+            grid.addWidget(self.hover_plot_output, 0, 4)
+            grid.addWidget(self.hover_plot_input_R, 1, 0)
+            grid.addWidget(QtWidgets.QLabel("→"), 1, 1)
+            grid.addWidget(self.hover_plot_filter2, 1, 2)
+            # Empty cells at (1,3) and (1,4) if desired
+            self.hover_panel.setLayout(grid)
+            self.hover_panel.hide()
+            # Connect mouse moves for hover detection
+            self.plot.scene().sigMouseMoved.connect(self.on_plot_mouse_moved)
+            self.hovered_speaker = None
+            self.hover_timer = QtCore.QTimer(self)
+            self.hover_timer.setInterval(100)        # refresh every 100 ms
+            self.hover_timer.timeout.connect(self.update_hover_fft_display)
+            self.hover_timer.start()
 
             self.head_circle = pg.ScatterPlotItem(
                 pen=pg.mkPen('r', width=2), brush=None, size=30
@@ -290,14 +339,6 @@ def xtc_lab_processor():
             )
             self.ear_dots.setZValue(3)
             self.plot.addItem(self.ear_dots)
-
-            self.ideal_marker = pg.ScatterPlotItem(
-                pen=None, brush=pg.mkBrush(0, 255, 0, 150), size=15
-            )
-            ideal_x = ideal_position[0] * scale_factor
-            ideal_y = ideal_position[1] * scale_factor
-            self.ideal_marker.setData([ideal_x], [ideal_y])
-            self.plot.addItem(self.ideal_marker)
 
             # Speaker->Ear lines
             self.speaker_ear_lines = []
@@ -323,6 +364,14 @@ def xtc_lab_processor():
             center_layout = QtWidgets.QVBoxLayout(center_widget)
             self.setCentralWidget(center_widget)
             center_layout.addWidget(self.plot)
+
+            # slider for head rotation
+            self.head_rotation_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+            self.head_rotation_slider.setRange(-180, 180)
+            center_layout.addWidget(self.head_rotation_slider)
+            self.head_rotation_slider.setValue(0)
+            self.head_rotation_slider.valueChanged.connect(self.update_head_rotation)
+
             reset_button = QtWidgets.QPushButton("Reset Head Position")
             reset_button.clicked.connect(self.reset_head)
             center_layout.addWidget(reset_button)
@@ -334,15 +383,19 @@ def xtc_lab_processor():
             inspect_hrir_button.clicked.connect(self.open_hrir_inspection_modal)
             center_layout.addWidget(inspect_hrir_button)
 
+            self.filter_design_dropdown = QComboBox()
+            self.filter_design_dropdown.addItem("Adjugate Inversion")
+            self.filter_design_dropdown.addItem("Kirkeby Nelson")
+            self.filter_design_dropdown.currentIndexChanged.connect(self.reload_filters)
+            center_layout.addWidget(self.filter_design_dropdown)
 
             self.bypass_checkbox = QtWidgets.QCheckBox("Bypass Filters")
-            self.bypass_checkbox.stateChanged.connect(self.update_audio_engine)
+            self.bypass_checkbox.stateChanged.connect(self.toggle_bypass)
             center_layout.addWidget(self.bypass_checkbox)
 
             self.energy_checkbox = QtWidgets.QCheckBox("Show Energy Distribution")
             self.energy_checkbox.stateChanged.connect(self.toggle_energy_distribution)
             center_layout.addWidget(self.energy_checkbox)
-
 
             if self.config["binaural_device"] == "..." or self.config["playback_device"] == "...":
                 QtCore.QTimer.singleShot(100, self.open_settings_menu)
@@ -350,12 +403,93 @@ def xtc_lab_processor():
             self.auto_range_topdown_plot()
 
             self.load_default_filters()
-
+            # Start the audio engine at launch
+            self.update_audio_engine()
             self.update_plot()
+            
+        def update_hover_fft_display(self):
+            """Periodically refresh the hover-panel FFT plots if visible."""
+            if not self.hover_panel.isVisible() or self.hovered_speaker is None:
+                return
+
+            # --- Real-time input FFTs from AudioEngine ---
+            block = getattr(self.audio_engine, "latest_binaural_block", None)
+            if block is not None:
+                data_L = block[:, 0]
+                data_R = block[:, 1]
+            else:
+                # fallback to zeros
+                data_L = np.zeros(512)
+                data_R = np.zeros(512)
+            N = len(data_L)
+            freqs = np.fft.rfftfreq(N, d=1.0 / self.samplerate)
+            mag_L = np.abs(np.fft.rfft(data_L))
+            mag_R = np.abs(np.fft.rfft(data_R))
+            # Update input FFT plots
+            self.hover_plot_input_L.clear()
+            self.hover_plot_input_L.plot(freqs, 20 * np.log10(mag_L + 1e-12))
+            self.hover_plot_input_R.clear()
+            self.hover_plot_input_R.plot(freqs, 20 * np.log10(mag_R + 1e-12))
+
+            # --- Real-time output FFT for hovered speaker ---
+            out_block = getattr(self.audio_engine, "latest_output_block", None)
+            if out_block is not None:
+                # select channel: 0 for left speaker, 1 for right speaker
+                chan = self.hovered_speaker
+                data_out = out_block[:, chan]
+            else:
+                data_out = np.zeros(N)
+            mag_out = np.abs(np.fft.rfft(data_out))
+            self.hover_plot_output.clear()
+            self.hover_plot_output.plot(freqs, 20 * np.log10(mag_out + 1e-12))
+
+        def on_plot_mouse_moved(self, scene_pos):
+            """
+            Show or hide the hover panel when cursor is over a speaker dot.
+            """
+            from PyQt6.QtGui import QCursor
+            from PyQt6.QtCore import QPoint
+            # Map scene coordinate to data coordinates (un-scaled)
+            vb = self.plot.getViewBox()
+            mp = vb.mapSceneToView(scene_pos)
+            x = mp.x() / scale_factor
+            y = mp.y() / scale_factor
+
+            # Check proximity to each speaker
+            for i, sp in enumerate(original_speaker_positions):
+                if np.hypot(x - sp[0], y - sp[1]) < 0.1:
+                    # Position the floating panel just above the cursor
+                    global_pos = QCursor.pos()
+                    self.hover_panel.move(global_pos + QPoint(10, -self.hover_panel.height() - 10))
+                    # Remember which speaker is hovered
+                    self.hovered_speaker = i
+                    # Compute and update filter FFTs once on hover
+                    if i == 0:
+                        arr1, arr2 = self.fll, self.frl
+                    else:
+                        arr1, arr2 = self.flr, self.frr
+                    freqs = np.fft.rfftfreq(len(arr1), d=1.0 / self.samplerate)
+                    mag1 = np.abs(np.fft.rfft(arr1))
+                    mag2 = np.abs(np.fft.rfft(arr2))
+                    self.hover_plot_filter1.clear()
+                    self.hover_plot_filter1.plot(freqs, 20 * np.log10(mag1 + 1e-12))
+                    self.hover_plot_filter2.clear()
+                    self.hover_plot_filter2.plot(freqs, 20 * np.log10(mag2 + 1e-12))
+                    # Show panel and return
+                    self.hover_panel.show()
+                    return
+
+            # Not hovering any speaker
+            self.hovered_speaker = None
+            self.hover_panel.hide()
 
         def update_audio_engine(self):
             if hasattr(self, "audio_engine"):
-                del self.audio_engine
+                # Stop and close existing streams before recreating
+                try:
+                    self.audio_engine.close()
+                except Exception:
+                    pass
             with self.filter_lock:
                 self.audio_engine = AudioEngine(
                     config=self.config,
@@ -366,6 +500,12 @@ def xtc_lab_processor():
                     f22=self.frr,
                     bypass=self.bypass_checkbox.isChecked()
                 )
+
+        def toggle_bypass(self, state):
+            """Toggle filter bypass without restarting audio streams."""
+            checked = self.bypass_checkbox.isChecked()
+            if hasattr(self, "audio_engine"):
+                self.audio_engine.set_bypass(checked)
             
         def open_settings_menu(self):
             settings_dialog = QtWidgets.QDialog(self)
@@ -500,16 +640,41 @@ def xtc_lab_processor():
             hrtf_combo.setCurrentText(self.config["hrtf_file"])
 
             settings_dialog.exec()
-            
+        
+        def update_head_rotation(self):
+            self.head_rotation = self.head_rotation_slider.value()
+            # Update the head circle position
+            self.reload_filters()
+            self.update_plot()
+
         def update_meters(self, levels):
             for i, level in enumerate(levels[:len(self.meter_bars)]):
                 self.meter_bars[i].set_level(level)
+                
+        def get_azimuth_pair(self):
+            """
+            Get the azimuth pair for the current head position.
+            """
+            # Compute source azimuths relative to the (possibly rotated) head
+            source_azimuths = []
+            for pos in original_speaker_positions:
+                dx = pos[0] - head_position[0]
+                dy = pos[1] - head_position[1]
+                # arctan2(dx, dy) yields angle from +Y axis
+                base_angle = np.degrees(np.arctan2(dx, dy))
+                # Offset by head rotation and wrap into [0,360)
+                az = (base_angle + self.head_rotation) % 360
+                source_azimuths.append(az)
+            source_azimuth_L, source_azimuth_R = source_azimuths
+            print(f"Source azimuths: L={source_azimuth_L:.1f}°, R={source_azimuth_R:.1f}°")
+            return source_azimuth_L, source_azimuth_R
 
-        def reload_filters(self):
+
+        def reload_filters(self, format='FrequencyDomain'):
             try:
                 left_az_deg, right_az_deg = self.get_azimuth_pair()                
-                HRIR_LL, HRIR_LR, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg) # Left speaker left ear, Left speaker right ear
-                HRIR_RL, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg) # Right speaker left ear, Right speaker right ear
+                HRIR_LL, HRIR_RL, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg, show_plots=False, attempt_interpolate=True) # Left speaker left ear, Left speaker right ear
+                HRIR_LR, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg, show_plots=False, attempt_interpolate=True) 
                 self.hll = HRIR_LL
                 self.hlr = HRIR_LR
                 self.hrl = HRIR_RL
@@ -518,28 +683,26 @@ def xtc_lab_processor():
                 assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
                 self.samplerate = sample_rate_l[0]
                 H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
-                self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, 8192, samplerate=self.samplerate, debug=False)
-                print("Filters reloaded successfully.")
+                if self.filter_design_dropdown.currentText() == "Kirkeby Nelson":
+                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
+                else:
+                    if format=='TimeDomain':
+                        self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
+                        # Debug: report raw filter peak magnitudes
+                        print(f"Filter peaks (raw): fll={np.max(np.abs(self.fll)):.3f}, flr={np.max(np.abs(self.flr)):.3f}, frl={np.max(np.abs(self.frl)):.3f}, frr={np.max(np.abs(self.frr)):.3f}")
+                        print("Filters reloaded successfully.")
+                        # invalidate filters in omega
+                        self.FLL = self.FLR = self.FRL = self.FRR = None
+                    else:
+                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
+                        print("Filters reloaded successfully.")
+                        # invalidate filters in time
+                        self.fll = self.flr = self.frl = self.frr = None
             except Exception as e:
                 print(f"Error loading default filters: {e}")
                 
-        def get_azimuth_pair(self):
-            """
-            Get the azimuth pair for the current head position.
-            """
-            for i, pos in enumerate(original_speaker_positions):
-                angle = np.degrees(np.arctan2(pos[0] - head_position[0], pos[1] - head_position[1]))
-                if i == 0:
-                    source_azimuth_L = angle
-                elif i == 1:
-                    source_azimuth_R = angle
-            source_azimuth_L
-            source_azimuth_R
-            print(f"Source azimuths: L={source_azimuth_L}, R={source_azimuth_R}")
-            return source_azimuth_L, source_azimuth_R
-
                 
-        def load_default_filters(self):
+        def load_default_filters(self, format='FrequencyDomain'):
             """
             Load the default P0275 HRIR filters.
             """
@@ -548,8 +711,8 @@ def xtc_lab_processor():
 
             try:
                 left_az_deg, right_az_deg = self.get_azimuth_pair()                
-                HRIR_LL, HRIR_LR, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg) # Left speaker left ear, Left speaker right ear
-                HRIR_RL, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg) # Right speaker left ear, Right speaker right ear
+                HRIR_LL, HRIR_RL, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg) # Left speaker left ear, Left speaker right ear
+                HRIR_LR, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg) # Right speaker left ear, Right speaker right ear
                 self.hll = HRIR_LL
                 self.hlr = HRIR_LR
                 self.hrl = HRIR_RL
@@ -558,18 +721,33 @@ def xtc_lab_processor():
                 assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
                 self.samplerate = sample_rate_l[0]
                 H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
-                self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, 8192, samplerate=self.samplerate, debug=False)
-                print("Default filters loaded successfully.")
+                if self.filter_design_dropdown.currentText() == "Kirkeby Nelson":
+                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
+                else:
+                    if format=='TimeDomain':
+                        self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True, format=format)
+                        # Debug: report raw filter peak magnitudes
+                        print(f"Filter peaks (raw): fll={np.max(np.abs(self.fll)):.3f}, flr={np.max(np.abs(self.flr)):.3f}, frl={np.max(np.abs(self.frl)):.3f}, frr={np.max(np.abs(self.frr)):.3f}")
+                        print("Filters reloaded successfully, format is", format)
+                        # invalidate filters in omega
+                        self.FLL = self.FLR = self.FRL = self.FRR = None
+                    else:
+                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True, format=format)
+                        print("Filters reloaded successfully, format is", format)
+                        # invalidate filters in time
+                        self.fll = self.flr = self.frl = self.frr = None
             except Exception as e:
                 print(f"Error loading default filters: {e}")
 
         def toggle_energy_distribution(self):
             self.energy_distribution_enabled = self.energy_checkbox.isChecked()
+            # Show or hide the energy image
+            self.energy_item.setVisible(self.energy_distribution_enabled)
             self.update_plot()
 
         def auto_range_topdown_plot(self):
-            coords_x = list(original_speaker_positions[:,0]) + [head_position[0], ideal_position[0]]
-            coords_y = list(original_speaker_positions[:,1]) + [head_position[1], ideal_position[1]]
+            coords_x = list(original_speaker_positions[:,0]) + [head_position[0]]
+            coords_y = list(original_speaker_positions[:,1]) + [head_position[1]]
 
             x_min, x_max = min(coords_x), max(coords_x)
             y_min, y_max = min(coords_y), max(coords_y)
@@ -589,22 +767,120 @@ def xtc_lab_processor():
             self.plot.setXRange(x_min, x_max)
             self.plot.setYRange(y_min, y_max)
 
-        def compute_energy_distribution(self):
-            """
-            Fully simulate 2x2 MIMO crosstalk approach at each grid point
-            in [-2..2] x [-2..2], sampling 100 points per axis.
-            
-            For each grid point:
-            1) We do 'EarL=Impulse, EarR=0'  => measure net_right_ear power
-            2) We do 'EarL=0,       EarR=Impulse' => measure net_left_ear  power
-            We average those two contralateral powers, then store it as -10 log10(...) in a 2D array.
+        def plot_rotational_error(self):
+            self.fll = self.flr = self.frl = self.frr = None
 
-            Returns:
-            xvals, yvals, energy_map
-                where xvals, yvals are length=grid_size,
-                and energy_map.shape = (grid_size, grid_size).
-            """
-            import numpy as np
+            import os
+            results_file = "rotational_error.txt"
+            # Load previously computed results
+            diff_left_list = []
+            diff_right_list = []
+            angle_list = []
+            processed_angles = set()
+            if os.path.exists(results_file):
+                with open(results_file, 'r') as rf:
+                    for line in rf:
+                        try:
+                            ang_str, dl_str, dr_str = line.strip().split(',')
+                            ang = int(ang_str)
+                            dl = float(dl_str)
+                            dr = float(dr_str)
+                        except ValueError:
+                            continue
+                        processed_angles.add(ang)
+                        angle_list.append(ang)
+                        diff_left_list.append(dl)
+                        diff_right_list.append(dr)
+
+            print("===== PLOTTING ROTATIONAL ERROR =====")
+            for angle in range(-180, 175, 1):
+                if angle in processed_angles:
+                    continue
+                print("Processing angle:", angle)
+                self.head_rotation = angle
+                left_az_deg, right_az_deg = self.get_azimuth_pair()
+                print("left_az_deg:", left_az_deg, "right_az_deg:", right_az_deg)
+                try:
+                    HRIR_LL, HRIR_RL, sample_rate_l = xtc.extract_hrirs_sam(
+                        self.current_sofa_file, left_az_deg, show_plots=False, attempt_interpolate=False
+                    )
+                    HRIR_LR, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(
+                        self.current_sofa_file, right_az_deg, show_plots=False, attempt_interpolate=False
+                    )
+                    self.hll, self.hrl, _ = xtc.extract_hrirs_sam(
+                        self.current_sofa_file, left_az_deg, show_plots=False, attempt_interpolate=True
+                    )
+                    self.hlr, self.hrr, _ = xtc.extract_hrirs_sam(
+                        self.current_sofa_file, right_az_deg, show_plots=False, attempt_interpolate=True
+                    )
+
+                    # self.hll = HRIR_LL
+                    # self.hlr = HRIR_LR
+                    # self.hrl = HRIR_RL
+                    # self.hrr = HRIR_RR
+                except Exception as e:
+                    print(f"Skipping angle {angle} due to error: {e}")
+                    continue
+                assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
+                self.samplerate = sample_rate_l[0]
+                H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
+                self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(
+                    H_LL, H_LR, H_RL, H_RR,
+                    original_speaker_positions, head_position,
+                    filter_length=2048, samplerate=self.samplerate,
+                    debug=False, format='FrequencyDomain'
+                )
+                print("calling get acoustics data")
+                lines = self.get_acoustics_data()
+                ipsi_ir_left, contra_ir_left = lines[0]
+                ipsi_ir_right, contra_ir_right = lines[1]
+                N_left = len(ipsi_ir_left)
+                mag_ipsi_left = 20 * np.log10(
+                    np.abs(np.fft.fft(ipsi_ir_left)[:N_left // 2]) + 1e-12
+                )
+                mag_contra_left = 20 * np.log10(
+                    np.abs(np.fft.fft(contra_ir_left)[:N_left // 2]) + 1e-12
+                )
+                N_right = len(ipsi_ir_right)
+                mag_ipsi_right = 20 * np.log10(
+                    np.abs(np.fft.fft(ipsi_ir_right)[:N_right // 2]) + 1e-12
+                )
+                mag_contra_right = 20 * np.log10(
+                    np.abs(np.fft.fft(contra_ir_right)[:N_right // 2]) + 1e-12
+                )
+                # Compute average magnitude differences
+                diff_left = np.mean(mag_ipsi_left - mag_contra_left)
+                diff_right = np.mean(mag_ipsi_right - mag_contra_right)
+                # Save result
+                angle_list.append(angle)
+                diff_left_list.append(diff_left)
+                diff_right_list.append(diff_right)
+                with open(results_file, 'a') as rf:
+                    rf.write(f"{angle},{diff_left},{diff_right}\n")
+
+            # Sort results for plotting
+            sorted_data = sorted(zip(angle_list, diff_left_list, diff_right_list), key=lambda x: x[0])
+            if sorted_data:
+                angles_sorted, diff_left_sorted, diff_right_sorted = zip(*sorted_data)
+            else:
+                angles_sorted, diff_left_sorted, diff_right_sorted = [], [], []
+
+            # Plot all stored results
+            import matplotlib.pyplot as plt
+            fig = plt.figure(figsize=(8, 8))
+            ax = fig.add_subplot(111, projection='polar')
+            angles_rad = np.deg2rad(angles_sorted)
+            ax.plot(angles_rad, diff_left_sorted, 'r-', label='Left Ear ΔdB')
+            ax.plot(angles_rad, diff_right_sorted, 'b-', label='Right Ear ΔdB')
+            ax.set_theta_direction(-1)
+            ax.set_theta_zero_location('N')
+            ax.set_title('Error in Rotational Invariance - Interp\n', va='bottom')
+            ax.legend(loc='upper right')
+            plt.show()
+
+        def compute_energy_distribution(self):
+            # Ensure the energy image is visible
+            self.energy_item.setVisible(True)
             
             grid_size = 100
             xvals = np.linspace(-2, 2, grid_size)
@@ -616,89 +892,78 @@ def xtc_lab_processor():
             earL_imp[0] = 1.0
             earR_imp = np.zeros(ir_len)
             earR_imp[0] = 1.0
+            N = (
+                max(len(self.fll), len(self.flr), len(self.frl), len(self.frr))
+                + max(len(self.hll), len(self.hlr), len(self.hrl), len(self.hrr))
+            )
+            F_ll = np.fft.fft(self.fll, N)
+            F_lr = np.fft.fft(self.flr, N)
+            F_rl = np.fft.fft(self.frl, N)
+            F_rr = np.fft.fft(self.frr, N)
+            d = np.load("hrir_cache.npz")
+            self.H_cache_left  = {}
+            self.H_cache_right = {}
+            for az, HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR in zip(
+                    d["left_az"], d["HRIR_LL"], d["HRIR_LR"], d["HRIR_RL"], d["HRIR_RR"]):
+                self.H_cache_left[az]  = (np.fft.fft(HRIR_LL, N), np.fft.fft(HRIR_LR, N))
+                self.H_cache_right[az] = (np.fft.fft(HRIR_RL, N), np.fft.fft(HRIR_RR, N))
 
             for j, yval in enumerate(yvals):
                 for i, xval in enumerate(xvals):
-                    test_pos = np.array([xval, yval])
+                    # Compute azimuth angles for this grid cell
+                    left_az_deg  = np.degrees(np.arctan2(yval - head_position[1], xval - head_position[0]))
+                    right_az_deg = np.degrees(np.arctan2(yval - head_position[1], xval - head_position[0]))
+                    az_L = int(round(left_az_deg/5)*5) % 360
+                    az_R = int(round(right_az_deg/5)*5) % 360
+                    H_ll, H_lr = self.H_cache_left[az_L]
+                    H_rl, H_rr = self.H_cache_right[az_R]
 
-                    # 1) 'EarL=Impulse'
-                    netL_Limp, netR_Limp = self.compute_net_transfer_functions(test_pos,
-                                                                            earL_imp,
-                                                                            np.zeros_like(earL_imp))
-                    # contralateral is netR_Limp => measure total power
-                    contralateral_L_scenario = np.sum(netR_Limp**2)
+                    # Removed redundant FFTs of HRIRs here to use cached FFTs
+                    X_LL = H_ll*F_ll + H_lr*F_rl
+                    X_LR = H_ll*F_lr + H_lr*F_rr
+                    X_RL = H_rl*F_ll + H_rr*F_rl
+                    X_RR = H_rl*F_lr + H_rr*F_rr
 
-                    # 2) 'EarR=Impulse'
-                    netL_Rimp, netR_Rimp = self.compute_net_transfer_functions(test_pos,
-                                                                            np.zeros_like(earR_imp),
-                                                                            earR_imp)
-                    # contralateral is netL_Rimp => measure total power
-                    contralateral_R_scenario = np.sum(netL_Rimp**2)
+                    # Compute magnitudes
+                    mag_X_LL = np.abs(X_LL)
+                    mag_X_LR = np.abs(X_LR)
+                    mag_X_RL = np.abs(X_RL)
+                    mag_X_RR = np.abs(X_RR)
+                    #print("Magnitudes: LL={}, LR={}, RL={}, RR={}".format(mag_X_LL, mag_X_LR, mag_X_RL, mag_X_RR))
+                    # Only use positive frequencies
+                    half = N // 2
+                    # Average magnitudes over positive bins
+                    ipsi_L = np.mean(mag_X_LL[:half])
+                    contra_L = np.mean(mag_X_RL[:half])
+                    ipsi_R = np.mean(mag_X_RR[:half])
+                    contra_R = np.mean(mag_X_LR[:half])
+                    # Compute global averages
+                    avg_ipsi = (ipsi_L + ipsi_R) / 2
+                    avg_contra = (contra_L + contra_R) / 2
+                    
+                    # take the mean of the avg_ipsi array
+                    avg_avg_ipsi = np.mean(avg_ipsi)
+                    avg_avg_contra = np.mean(avg_contra)
 
-                    # Average contralateral power
-                    # (EarL=Imp => rightEar) + (EarR=Imp => leftEar)
-                    mean_contralateral_power = 0.5 * (contralateral_L_scenario + contralateral_R_scenario)
-
-                    # Convert power to dB, negative means good cancellation
-                    # Also note that a single impulse has power=1 in time domain
-                    # so do: energy_map[j,i] = -10 * log10(mean_contralateral + 1e-12), etc.
-                    energy_map[j, i] = -10.0 * np.log10(mean_contralateral_power + 1e-12)
+                    # Store the difference in the energy map
+                    energy_map[j, i] = avg_avg_ipsi - avg_avg_contra
+                    print("setting pixel to {}".format(energy_map[j, i]))
+                    # Update with automatic level scaling and correct orientation
+                    display_map = energy_map.T[::-1, :]
+                    self.energy_item.setImage(display_map, autoLevels=True)
+                    QtWidgets.QApplication.processEvents()
 
             return xvals, yvals, energy_map
         
         def get_acoustics_data(self):
-            """
-            Our broad goal here is to show the following transfer functions:
-            1) Left System Input to Left Ear (Left Ipsilateral) (left Graph)
-            2) Right System Input to Left Ear (Left Contralateral) (Left Graph)
-            3) Right System Input to Right Ear (Right Ipsilateral) (Right Graph)
-            4) Left System Input to Right Ear (Right Contralateral) (Right Graph)
-
-            To do this, we simulate two impulses, one corresponding to each system input.
-            We then apply the following "sub" transfer functions to each of these.
-
-            This system of equations looks like E = HPFS
-            where E is the ear pressure vector
-            H is the HRTF matrix
-            P is the delay matrix pulled out of the HRTF
-            F is the filter matrix
-            S is the system input vector
-
-            We can calculate the ear pressure:
-                Starting with an impulse for each system input, we then:
-                1) Convolve this with the filter matrix to get FS
-                2) Convolve this matrix with the delay matrix to get the pre-hrtf signal at the head
-                3) convolve this with the HRTF matrix to get the ear pressure vectors
-            
-            The result is four transfer functions, which we can plot.
-            This is in the format:
-                (Left_Ear_Left_Channel, Left_Ear_Right_Channel),
-                (Right_Ear_Right_Channel, Right_Ear_Left_Channel),
-                (t, f11_centered),
-                (t, f12_centered),
-                (t, f21_centered),
-                (t, f22_centered)
-            """
-            def zero_shift(x, d):
-                if d >= 0:
-                    return np.concatenate([np.zeros(d), x])[:len(x)]
-                else:
-                    return x[-d:]
-                
-            delay_samples_l = int(np.round(
-                (np.linalg.norm(original_speaker_positions[0] - head_position) / c) * self.samplerate
-            ))
-            delay_samples_r = int(np.round(
-                (np.linalg.norm(original_speaker_positions[1] - head_position) / c) * self.samplerate
-            ))
-
             with self.filter_lock:
                 # Compute propagation delays to the head (in samples)
-                N = (
+                if self.fll is None or self.flr is None or self.frl is None or self.frr is None:
+                    N = self.FLL.shape[0] #number of FFT points.
+                else: N = (
                     max(len(self.fll), len(self.flr), len(self.frl), len(self.frr))
                     + max(len(self.hll), len(self.hlr), len(self.hrl), len(self.hrr))
                 )
-
                 # We could simulate the impulse, but we don't need to
                 # Because it's the same as multiplying by 1.
 
@@ -707,16 +972,62 @@ def xtc_lab_processor():
                 H_rl = np.fft.fft(self.hrl, N)
                 H_rr = np.fft.fft(self.hrr, N)
 
-                F_ll = np.fft.fft(self.fll, N)
-                F_lr = np.fft.fft(self.flr, N)
-                F_rl = np.fft.fft(self.frl, N)
-                F_rr = np.fft.fft(self.frr, N)
+                delay_samples_l = int(np.round(np.linalg.norm(original_speaker_positions[0] - head_position) / 343.0 * self.samplerate))
+                delay_samples_r = int(np.round(np.linalg.norm(original_speaker_positions[1] - head_position) / 343.0 * self.samplerate))
+                if delay_samples_l == delay_samples_r:
+                    print("Left and right sources are coherent, no delay applied")
+                    tau_L = 0
+                    tau_R = 0
+                elif delay_samples_l > delay_samples_r:
+                    tau_L = 0
+                    tau_R = (delay_samples_l - delay_samples_r)/self.samplerate
+                    print("applied {} seconds of delay to right".format(tau_R))
+                elif delay_samples_r > delay_samples_l:
+                    tau_L = (delay_samples_r - delay_samples_l)/self.samplerate
+                    tau_R = 0
+                    print("applied {} seconds of delay to left".format(tau_L))
+                
+                if delay_samples_l != 0 or delay_samples_r != 0:
+                    freqs = np.fft.fftfreq(N, d=1/self.samplerate)
+                    omega = 2 * np.pi * freqs
+                
+                    exp_L = np.exp(1j * omega * tau_L)    # for the left speaker
+                    exp_R = np.exp(1j * omega * tau_R)    # for the right speaker
+
+                    H_ll = H_ll * exp_L
+                    H_lr = H_lr * exp_R
+                    H_rl = H_rl * exp_L
+                    H_rr = H_rr * exp_R
+
+
+                # match delay applied to make filters causal.
+                delay_samples_l = -700
+                delay_samples_r = -700
+                freqs = np.fft.fftfreq(N, d=1/self.samplerate)
+                omega = 2 * np.pi * freqs
+                tau_L = delay_samples_l / self.samplerate
+                tau_R = delay_samples_r / self.samplerate
+                exp_L = np.exp(1j * omega * tau_L)
+                exp_R = np.exp(1j * omega * tau_R)
+
+                H_ll *= exp_L
+                H_lr *= exp_R
+                H_rl *= exp_L
+                H_rr *= exp_R
+
+                if self.FLL is not None:
+                    F_ll = self.FLL
+                    F_lr = self.FLR
+                    F_rl = self.FRL
+                    F_rr = self.FRR
+                else:
+                    F_ll = np.fft.fft(self.fll, N)
+                    F_lr = np.fft.fft(self.flr, N)
+                    F_rl = np.fft.fft(self.frl, N)
+                    F_rr = np.fft.fft(self.frr, N)
 
                 freqs = np.fft.fftfreq(N, d=1/self.samplerate)
                 omega = 2 * np.pi * freqs
-
-                exp_L = np.exp(1j * omega * -delay_samples_l/self.samplerate)    # for the left speaker
-                exp_R = np.exp(1j * omega * -delay_samples_r/self.samplerate)    # for the right speaker
 
                 X_LL = H_ll*F_ll + H_lr*F_rl
                 X_LR = H_ll*F_lr + H_lr*F_rr
@@ -733,130 +1044,12 @@ def xtc_lab_processor():
                 Right_Ear_Right_Channel = x_RR
                 Right_Ear_Left_Channel = x_RL
 
-                # Build unit impulses long enough to carry filter + HRIR
-                # N_imp = (
-                #     max(len(self.fll), len(self.flr), len(self.frl), len(self.frr))
-                #     + max(len(self.hll), len(self.hlr), len(self.hrl), len(self.hrr))
-                # )
-                # S_L = np.zeros(N_imp); S_L[0] = 1.0
-                # S_R = np.zeros(N_imp); S_R[0] = 1.0
+                if self.fll is None or self.flr is None or self.frl is None or self.frr is None:
+                    self.fll = np.fft.ifft(F_ll).real
+                    self.flr = np.fft.ifft(F_lr).real
+                    self.frl = np.fft.ifft(F_rl).real
+                    self.frr = np.fft.ifft(F_rr).real
 
-                # # --- Response at ears for left‐channel impulse (ipsilateral = flat) ---
-                # # Left input → Left speaker, then propagate to head
-                # X_L_from_L = zero_shift(
-                #     np.convolve(S_L, self.fll, mode='full'),
-                #     delay_samples_l
-                # )
-                # print("  X_L_from_L first non-zero index:", np.argmax(np.abs(X_L_from_L)))
-                # print("delay L, ", delay_samples_l)
-
-                # # Left input → Right speaker, then propagate to head
-                # X_R_from_L = zero_shift(
-                #     np.convolve(S_L, self.frl, mode='full'),
-                #     delay_samples_r
-                # )
-                # # Left‐ear response (ipsilateral)
-                # E_Lipsi = (
-                #     np.convolve(X_L_from_L, self.hll, mode='full')
-                #     + np.convolve(X_R_from_L, self.hrl, mode='full')
-                # )
-                # # Right‐ear response to left input (contralateral for right ear)
-                # E_Rcontra = (
-                #     np.convolve(X_L_from_L, self.hlr, mode='full')
-                #     + np.convolve(X_R_from_L, self.hrr, mode='full')
-                # )
-
-                # # --- Response at ears for right‐channel impulse (contralateral = cancelled) ---
-                # X_L_from_R = zero_shift(
-                #     np.convolve(S_R, self.flr, mode='full'),
-                #     delay_samples_l
-                # )
-                # X_R_from_R = zero_shift(
-                #     np.convolve(S_R, self.frr, mode='full'),
-                #     delay_samples_r
-                # )
-                # # Left‐ear response to right input (contralateral)
-                # E_Lcontra = (
-                #     np.convolve(X_L_from_R, self.hll, mode='full')
-                #     + np.convolve(X_R_from_R, self.hrl, mode='full')
-                # )
-                # # Right‐ear response (ipsilateral)
-                # E_Ripsi = (
-                #     np.convolve(X_L_from_R, self.hlr, mode='full')
-                #     + np.convolve(X_R_from_R, self.hrr, mode='full')
-                # )
-
-                # # Assign into the four TF outputs for plotting
-                # Left_Ear_Left_Channel  = E_Lipsi
-                # Left_Ear_Right_Channel = E_Lcontra
-                # Right_Ear_Right_Channel = E_Ripsi
-                # Right_Ear_Left_Channel  = E_Rcontra
-
-                if self.fll is not None:
-                    def align_by_peak(ir):
-                        peak_index = np.argmax(np.abs(ir))
-                        centered = np.roll(ir, len(ir)//2 - peak_index)
-                        return centered
-
-                    f11_centered = align_by_peak(self.fll)
-                    f12_centered = align_by_peak(self.flr)
-                    f21_centered = align_by_peak(self.frl)
-                    f22_centered = align_by_peak(self.frr)
-
-                    t = np.arange(len(f11_centered)) / self.samplerate
-
-                    self.tf_curves[2][0].setData(t, f11_centered)  # f11
-                    self.tf_curves[3][0].setData(t, f12_centered)  # f12
-                    self.tf_curves[4][0].setData(t, f21_centered)  # f21
-                    self.tf_curves[5][0].setData(t, f22_centered)  # f22
-
-            # with self.filter_lock:
-
-            #     # If the filters haven't been computed yet, return empty arrays
-            #     if any(f is None for f in [self.f11_time, self.f12_time, self.f21_time, self.f22_time]):
-            #         return [(np.array([0.0]), np.array([0.0]))] * 4
-                
-            #     # Step 1: Start with "inputs" to the system
-            #     Left_Input = np.zeros(4096)
-            #     Right_Input = np.zeros(4096)
-            #     Left_Input[0] = 1.0
-            #     Right_Input[0] = 1.0
-
-            #     # Step 2: Convolve with the filters
-            #     Left_Speaker_Left_Channel = np.convolve(Left_Input, self.f11_time, mode='full')
-            #     Right_Speaker_Left_Channel = np.convolve(Left_Input, self.f21_time, mode='full')
-            #     Left_Speaker_Right_Channel = np.convolve(Right_Input, self.f12_time, mode='full')
-            #     Right_Speaker_Right_Channel = np.convolve(Right_Input, self.f22_time, mode='full')
-
-            #     # Step 3: Delay the signals to simulate travel to the head, using the distance between the head and the speakers
-            #     delay_samples_l = int(np.round((np.linalg.norm(original_speaker_positions[0] - head_position) / c) * self.samplerate))
-            #     delay_samples_r = int(np.round((np.linalg.norm(original_speaker_positions[1] - head_position) / c) * self.samplerate))
-            #     Left_Speaker_Left_Channel = np.roll(Left_Speaker_Left_Channel, delay_samples_l)
-            #     Right_Speaker_Left_Channel = np.roll(Right_Speaker_Left_Channel, delay_samples_r)
-            #     Left_Speaker_Right_Channel = np.roll(Left_Speaker_Right_Channel, delay_samples_l)
-            #     Right_Speaker_Right_Channel = np.roll(Right_Speaker_Right_Channel, delay_samples_r)
-
-            #     # Step 4: Compute left ear transfer functions
-            #     Left_Ear_Left_Channel_Left_Speaker = np.convolve(Left_Speaker_Left_Channel, self.h_ll, mode='full')
-            #     Left_Ear_Left_Channel_Right_Speaker = np.convolve(Right_Speaker_Left_Channel, self.h_rl, mode='full')
-            #     # this is the left ear ipsilateral:
-            #     Left_Ear_Left_Channel = Left_Ear_Left_Channel_Left_Speaker + Left_Ear_Left_Channel_Right_Speaker
-            #     Left_Ear_Right_Channel_Left_Speaker = np.convolve(Left_Speaker_Right_Channel, self.h_ll, mode='full')
-            #     Left_Ear_Right_Channel_Right_Speaker = np.convolve(Right_Speaker_Right_Channel, self.h_rl, mode='full')
-            #     # this is the left ear contralateral:
-            #     Left_Ear_Right_Channel = Left_Ear_Right_Channel_Left_Speaker + Left_Ear_Right_Channel_Right_Speaker
-
-            #     # Step 5: Compute right ear transfer functions
-            #     Right_Ear_Left_Channel_Left_Speaker = np.convolve(Left_Speaker_Left_Channel, self.h_lr, mode='full')
-            #     Right_Ear_Left_Channel_Right_Speaker = np.convolve(Right_Speaker_Left_Channel, self.h_rr, mode='full')
-            #     # this is the right ear contralateral:
-            #     Right_Ear_Left_Channel = Right_Ear_Left_Channel_Left_Speaker + Right_Ear_Left_Channel_Right_Speaker
-            #     Right_Ear_Right_Channel_Left_Speaker = np.convolve(Left_Speaker_Right_Channel, self.h_lr, mode='full')
-            #     Right_Ear_Right_Channel_Right_Speaker = np.convolve(Right_Speaker_Right_Channel, self.h_rr, mode='full')
-            #     # this is the right ear ipsilateral:
-            #     Right_Ear_Right_Channel = Right_Ear_Right_Channel_Left_Speaker + Right_Ear_Right_Channel_Right_Speaker
-
-                # Plot 4 IRs: f11, f12, f21, f22
                 if self.fll is not None:
                     def align_by_peak(ir):
                         peak_index = np.argmax(np.abs(ir))
@@ -878,33 +1071,9 @@ def xtc_lab_processor():
                     self.tf_curves[3][0].setData(t, f12_centered)  # f12
                     self.tf_curves[4][0].setData(t, f21_centered)  # f21
                     self.tf_curves[5][0].setData(t, f22_centered)  # f22
-
-            import matplotlib.pyplot as plt
-
-            def zero_shift(x,d):
-                if d>=0: return np.concatenate([np.zeros(d), x])[:len(x)]
-                return x[-d:]
-            def align_to_peak(ir):
-                p = np.argmax(np.abs(ir)); return np.roll(ir, -p)
-
-            # # you already have H_ll, H_lr, … and FLL, FLR, etc.
-            # freqs = np.fft.fftfreq(N,1/self.samplerate)[:N//2]
-            # # 1) HF before any delay embed
-            # H_freq = np.array([[H_ll, H_lr],[H_rl, H_rr]])      # shape (2,2,N)
-            # F_raw  = np.array([[FLL, FLR],[FRL, FRR_raw]])
-            # HF_raw = np.einsum('imk,mjk->ijk', H_freq, F_raw)
-            # # 2) HF after you multiplied in your exp_L/exp_R
-            # F_emb  = np.array([[FLL, FLR],[FRL, FRR]])
-            # HF_del = np.einsum('imk,mjk->ijk', H_freq, F_emb)
-
-            # fig, axes = plt.subplots(2,2, figsize=(8,6))
-            # for (ax, data, title) in zip(axes.flat,
-            #                             [HF_raw[0,1,:], HF_del[0,1,:], HF_raw[1,0,:], HF_del[1,0,:]],
-            #                             ['Raw HF₁₂','Delayed HF₁₂','Raw HF₂₁','Delayed HF₂₁']):
-            #     mag = 20*np.log10(np.clip(np.abs(data[:N//2]),1e-16,None))
-            #     ax.plot(freqs, mag)
-            #     ax.set_title(title); ax.set_ylim(-120,5); ax.set_xlim(0,20000)
-            # plt.tight_layout(); plt.show()            plt.legend(); plt.title("Debug: aligned+windowed TFs"); plt.show()
+            
+            #horrible abuse of class variables here
+            self.fll = self.flr = self.frl = self.frr = None
             
             return [
                 (Left_Ear_Left_Channel, Left_Ear_Right_Channel),   # TF Left Ear
@@ -926,7 +1095,9 @@ def xtc_lab_processor():
                 y_min = yvals[0]*scale_factor
                 width = (xvals[-1]-xvals[0])*scale_factor
                 height= (yvals[-1]-yvals[0])*scale_factor
-                self.energy_item.setImage(energy_map.T)
+                # Display without transposing so that rows map to y and cols to x
+                display_map = energy_map.T[::-1, :]
+                self.energy_item.setImage(display_map, autoLevels=True)
                 self.energy_item.setRect(pg.QtCore.QRectF(x_min, y_min, width, height))
                 self.energy_item.setVisible(True)
             else:
@@ -937,14 +1108,26 @@ def xtc_lab_processor():
             hy = head_position[1]*scale_factor
             self.head_circle.setData([hx],[hy])
 
-            L_ear = head_position + np.array([-ear_offset/2, 0.0])
-            R_ear = head_position + np.array([ ear_offset/2, 0.0])
-            self.ear_dots.setData(
-                [L_ear[0]*scale_factor, R_ear[0]*scale_factor],
-                [L_ear[1]*scale_factor, R_ear[1]*scale_factor]
-            )
+            # Compute rotated ear positions around head center
+            theta = np.radians(self.head_rotation)
+            ear_offset = 0.15 / 2
+            # Offsets for left and right ears (x, y) relative to head center before rotation
+            offsets = np.array([[-ear_offset, 0.0], [ear_offset, 0.0]])
+            # Rotation matrix for angle theta
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            rot_mat = np.array([[cos_t, -sin_t],
+                                [sin_t,  cos_t]])
+            # Apply rotation
+            rotated = offsets.dot(rot_mat.T)
+            # Translate to head position
+            ear_positions = head_position + rotated
+            # Scale and plot
+            xs = ear_positions[:, 0] * scale_factor
+            ys = ear_positions[:, 1] * scale_factor
+            self.ear_dots.setData(xs, ys)
 
-            # Lines
+            # Unpack rotated ear positions for line connections
+            L_ear, R_ear = ear_positions
             connections = [
                 (original_speaker_positions[0], L_ear),
                 (original_speaker_positions[0], R_ear),
@@ -954,7 +1137,8 @@ def xtc_lab_processor():
 
             # Update angle labels
             for i, pos in enumerate(original_speaker_positions):
-                angle = np.degrees(np.arctan2(pos[0] - head_position[0], pos[1] - head_position[1]))
+                base_angle = np.degrees(np.arctan2(pos[0] - head_position[0], pos[1] - head_position[1]))
+                angle = (base_angle + self.head_rotation) % 360
                 if i == 0:
                     self.angle_labels[i].setText(f"H->L: {angle:.1f}°")
                 elif i == 1:
@@ -1002,93 +1186,59 @@ def xtc_lab_processor():
                     self.tf_curves[i][0].setData(t, ir)
 
 
-        def compute_net_transfer_functions(self, head_pos, earL, earR):
-            """
-            Same logic as apply_xtc_filters_mimo, but uses self.f11_time, etc.
-            """
-            # Convolve ear signals with the filters
-            with self.filter_lock:
-                if any(f is None for f in [self.fll, self.flr, self.frl, self.frr]):
-                    return np.zeros_like(earL), np.zeros_like(earR)
-                spkL_from_left = np.convolve(earL, self.fll, mode='same')
-                spkL_from_right= np.convolve(earR, self.flr, mode='same')
-                speaker_L = spkL_from_left + spkL_from_right
-
-                spkR_from_left = np.convolve(earL, self.frl, mode='same')
-                spkR_from_right= np.convolve(earR, self.frr, mode='same')
-                speaker_R = spkR_from_left + spkR_from_right
-
-                # Delays
-                L_ear = head_pos + np.array([-ear_offset/2, 0.0])
-                R_ear = head_pos + np.array([ ear_offset/2, 0.0])
-                distL_ear = np.linalg.norm(original_speaker_positions - L_ear, axis=1)
-                distR_ear = np.linalg.norm(original_speaker_positions - R_ear, axis=1)
-
-                delayL_samps = (distL_ear / c * self.samplerate).astype(int)
-                delayR_samps = (distR_ear / c * self.samplerate).astype(int)
-
-                spk0_left = np.roll(speaker_L, delayL_samps[0])
-                spk1_left = np.roll(speaker_R, delayL_samps[1])
-                net_left = spk0_left + spk1_left
-
-                spk0_right= np.roll(speaker_L, delayR_samps[0])
-                spk1_right= np.roll(speaker_R, delayR_samps[1])
-                net_right= spk0_right + spk1_right
-            return net_left, net_right
-
         def reset_head(self):
-            head_position[:] = ideal_position
+            self.head_rotation = 0
+            head_position[:] = np.array([1.0, 1.0])
+            self.reload_filters()
             self.update_plot()
             
-        def regenerate_filters_from_current_head_position(self):
-            self.reload_filters()
-
         def open_hrir_inspection_modal(self):
             try:
-                if self.hll is not None:
-                    data_4 = {
-                        "H_LL": self.hll,
-                        "H_LR": self.hlr,
-                        "H_RL": self.hrl,
-                        "H_RR": self.hrr,
-                        "samplerate": self.samplerate
-                    }
-                else:
-                    data_4 = xtc.extract_hrirs_sam(self.current_sofa_file, left_az=-30.0, right_az=30.0)
-                    print("Opened modal and extracted HRIRs")
-                H_LL, H_LR, H_RL, H_RR = data_4["H_LL"], data_4["H_LR"], data_4["H_RL"], data_4["H_RR"]
-                samplerate = data_4["samplerate"]
-                with self.filter_lock:
-                                    f11, f12, f21, f22 = xtc.generate_filter(
-                                        H_LL, H_LR, H_RL, H_RR,
-                                        head_position=head_position,
-                                        speaker_positions=original_speaker_positions,
-                                        filter_length=8192,
-                                        samplerate=samplerate,
-                                    )
+                self.plot_rotational_error()
+                # if self.hll is not None:
+                #     data_4 = {
+                #         "H_LL": self.hll,
+                #         "H_LR": self.hlr,
+                #         "H_RL": self.hrl,
+                #         "H_RR": self.hrr,
+                #         "samplerate": self.samplerate
+                #     }
+                # else:
+                #     data_4 = xtc.extract_hrirs_sam(self.current_sofa_file, left_az=-30.0, right_az=30.0)
+                #     print("Opened modal and extracted HRIRs")
+                # H_LL, H_LR, H_RL, H_RR = data_4["H_LL"], data_4["H_LR"], data_4["H_RL"], data_4["H_RR"]
+                # samplerate = data_4["samplerate"]
+                # with self.filter_lock:
+                #                     f11, f12, f21, f22 = xtc.generate_filter(
+                #                         H_LL, H_LR, H_RL, H_RR,
+                #                         head_position=head_position,
+                #                         speaker_positions=original_speaker_positions,
+                #                         filter_length=8192,
+                #                         samplerate=samplerate,
+                                    # )
             except Exception as e:
                 print(f"Error loading HRIRs: {e}")
                 return
 
-            dialog = QtWidgets.QDialog(self)
-            dialog.setWindowTitle("HRIRs and Inverted Filters")
-            layout = QtWidgets.QVBoxLayout(dialog)
+            # dialog = QtWidgets.QDialog(self)
+            # dialog.setWindowTitle("HRIRs and Inverted Filters")
+            # layout = QtWidgets.QVBoxLayout(dialog)
 
-            plot_widget = pg.GraphicsLayoutWidget()
-            layout.addWidget(plot_widget)
+            # plot_widget = pg.GraphicsLayoutWidget()
+            # layout.addWidget(plot_widget)
 
-            def plot_ir_row(title, left_data, right_data):
-                p = plot_widget.addPlot(title=title)
-                t = np.arange(len(left_data)) / samplerate
-                p.plot(t, left_data, pen='r', name="Left")
-                p.plot(t, right_data, pen='b', name="Right")
-                p.showGrid(x=True, y=True)
-                plot_widget.nextRow()
+            # def plot_ir_row(title, left_data, right_data):
+            #     p = plot_widget.addPlot(title=title)
+            #     t = np.arange(len(left_data)) / samplerate
+            #     p.plot(t, left_data, pen='r', name="Left")
+            #     p.plot(t, right_data, pen='b', name="Right")
+            #     p.showGrid(x=True, y=True)
+            #     plot_widget.nextRow()
 
-            plot_ir_row("HRIRs: H_LL and H_RR", H_LL, H_RR)
-            plot_ir_row("HRIRs: H_LR and H_RL", H_LR, H_RL)
-            plot_ir_row("Inverted Filters: f11 and f22", f11, f22)
-            plot_ir_row("Inverted Filters: f12 and f21", f12, f21)
+            # plot_ir_row("HRIRs: H_LL and H_RR", H_LL, H_RR)
+            # plot_ir_row("HRIRs: H_LR and H_RL", H_LR, H_RL)
+            # plot_ir_row("Inverted Filters: f11 and f22", f11, f22)
+            # plot_ir_row("Inverted Filters: f12 and f21", f12, f21)
 
             def open_fft_viewer(H_LL, H_LR, H_RL, H_RR):
                 # plot each fft of each IR separately , top grid of 4 H matrix
@@ -1166,6 +1316,7 @@ def xtc_lab_processor():
                 mouse_real = np.array([pos.x(), pos.y()])/scale_factor
                 head_position[:] = mouse_real
                 print("Dragging: calling update_plot()...")
+                self.window().reload_filters()
                 self.window().update_plot()
                 pg.QtWidgets.QApplication.processEvents()
                 event.accept()
