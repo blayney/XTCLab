@@ -20,13 +20,17 @@ import pyqtgraph as pg
 import os
 from pyqtgraph.Qt import QtWidgets, QtCore
 from PyQt6.QtWidgets import QApplication, QMainWindow, QDockWidget, QComboBox, QLabel, QPushButton
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
+from pythonosc import dispatcher, osc_server
+import threading
 from scipy.fft import fft
 from scipy.interpolate import interp1d
 from math import sin, cos, radians
 import xtc
 import level_meter
 from audio_engine import AudioEngine
+import matplotlib.pyplot as plt
+
 
 def list_audio_outputs():
     try:
@@ -124,6 +128,7 @@ def xtc_lab_processor():
             self.FRR = None
 
             self.head_rotation = 0
+            self.head_rotation_offset = 0
 
             self.fll = None
             self.flr = None
@@ -379,13 +384,23 @@ def xtc_lab_processor():
             settings_button = QtWidgets.QPushButton("Settings")
             settings_button.clicked.connect(self.open_settings_menu)
             center_layout.addWidget(settings_button)
+            geometry_button = QtWidgets.QPushButton("Geometry Setup")
+            geometry_button.clicked.connect(self.open_geometry_menu)
+            center_layout.addWidget(geometry_button)
+
             inspect_hrir_button = QtWidgets.QPushButton("Inspect HRIRs")
             inspect_hrir_button.clicked.connect(self.open_hrir_inspection_modal)
             center_layout.addWidget(inspect_hrir_button)
 
+            zero_head_angle = QtWidgets.QPushButton("Generate Filter Statistics")
+            zero_head_angle.clicked.connect(self.calibrate_tracker)
+            center_layout.addWidget(zero_head_angle)
+
             self.filter_design_dropdown = QComboBox()
             self.filter_design_dropdown.addItem("Adjugate Inversion")
-            self.filter_design_dropdown.addItem("Kirkeby Nelson")
+            self.filter_design_dropdown.addItem("Kirkeby Nelson Constant Reg")
+            self.filter_design_dropdown.addItem("Kirkeby Nelson Smart")
+
             self.filter_design_dropdown.currentIndexChanged.connect(self.reload_filters)
             center_layout.addWidget(self.filter_design_dropdown)
 
@@ -393,12 +408,34 @@ def xtc_lab_processor():
             self.bypass_checkbox.stateChanged.connect(self.toggle_bypass)
             center_layout.addWidget(self.bypass_checkbox)
 
+            # Head Tracker Checkbox
+            self.headtrack_checkbox = QtWidgets.QCheckBox("Enable Head Tracker")
+            self.headtrack_checkbox.stateChanged.connect(self.toggle_headtracker)
+            center_layout.addWidget(self.headtrack_checkbox)
+
+            # Head tracking state
+            self.headtracker_enabled = False
+            self.head_yaw = 0.0
+
             self.energy_checkbox = QtWidgets.QCheckBox("Show Energy Distribution")
             self.energy_checkbox.stateChanged.connect(self.toggle_energy_distribution)
             center_layout.addWidget(self.energy_checkbox)
 
             if self.config["binaural_device"] == "..." or self.config["playback_device"] == "...":
                 QtCore.QTimer.singleShot(100, self.open_settings_menu)
+
+            # Set up OSC for head tracking
+            self.osc_dispatcher = dispatcher.Dispatcher()
+            self.osc_dispatcher.set_default_handler(self.osc_handler)
+            self.osc_server = osc_server.ThreadingOSCUDPServer(("127.0.0.1", 8000), self.osc_dispatcher)
+            self.osc_thread = threading.Thread(target=self.osc_server.serve_forever, daemon=True)
+            self.osc_thread.start()
+
+            # Timer to update head rotation from tracker
+            self.headtrack_timer = QTimer(self)
+            self.headtrack_timer.setInterval(50)  # 20 Hz update
+            self.headtrack_timer.timeout.connect(self.update_headtrack)
+            self.headtrack_timer.start()
 
             self.auto_range_topdown_plot()
 
@@ -640,6 +677,39 @@ def xtc_lab_processor():
             hrtf_combo.setCurrentText(self.config["hrtf_file"])
 
             settings_dialog.exec()
+
+        def open_geometry_menu(self):
+            geometry_dialog = QtWidgets.QDialog(self)
+            geometry_dialog.setWindowTitle("Geometry Setup")
+            geometry_dialog.setModal(True)
+
+            layout = QtWidgets.QVBoxLayout(geometry_dialog)
+
+            spacing_label = QLabel("Speaker Spacing (cm):")
+            layout.addWidget(spacing_label)
+
+            spacing_input = QtWidgets.QDoubleSpinBox()
+            spacing_input.setRange(0, 500)
+            spacing_input.setValue(self.config.get('speaker_spacing_cm', 150))
+            spacing_input.setSuffix(" cm")
+            layout.addWidget(spacing_input)
+
+            save_button = QPushButton("Save")
+            layout.addWidget(save_button)
+
+            def save_geometry():
+                spacing_cm = spacing_input.value()
+                self.config['speaker_spacing_cm'] = spacing_cm
+                with open("xtc_lab_config.json", "w") as f:
+                    import json
+                    json.dump(self.config, f)
+                self.reload_filters()
+                self.update_plot()
+                geometry_dialog.accept()
+
+            save_button.clicked.connect(save_geometry)
+
+            geometry_dialog.exec()
         
         def update_head_rotation(self):
             self.head_rotation = self.head_rotation_slider.value()
@@ -683,8 +753,10 @@ def xtc_lab_processor():
                 assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
                 self.samplerate = sample_rate_l[0]
                 H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
-                if self.filter_design_dropdown.currentText() == "Kirkeby Nelson":
+                if self.filter_design_dropdown.currentText() == "Kirkeby Nelson Constant Reg":
                     self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
+                elif self.filter_design_dropdown.currentText() == "Kirkeby Nelson Smart":
+                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter_smart(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
                 else:
                     if format=='TimeDomain':
                         self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
@@ -722,17 +794,17 @@ def xtc_lab_processor():
                 self.samplerate = sample_rate_l[0]
                 H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
                 if self.filter_design_dropdown.currentText() == "Kirkeby Nelson":
-                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
+                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False)
                 else:
                     if format=='TimeDomain':
-                        self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True, format=format)
+                        self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
                         # Debug: report raw filter peak magnitudes
                         print(f"Filter peaks (raw): fll={np.max(np.abs(self.fll)):.3f}, flr={np.max(np.abs(self.flr)):.3f}, frl={np.max(np.abs(self.frl)):.3f}, frr={np.max(np.abs(self.frr)):.3f}")
                         print("Filters reloaded successfully, format is", format)
                         # invalidate filters in omega
                         self.FLL = self.FLR = self.FRL = self.FRR = None
                     else:
-                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True, format=format)
+                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
                         print("Filters reloaded successfully, format is", format)
                         # invalidate filters in time
                         self.fll = self.flr = self.frl = self.frr = None
@@ -1158,32 +1230,32 @@ def xtc_lab_processor():
                 delay_ms = (dist_m/c)*1000
                 mid = (spk+ear)/2.0
                 mid_scaled = mid*scale_factor
-
-            self.reload_filters()
-            lines = self.get_acoustics_data()
-            for i, data in enumerate(lines):
-                if i == 0:
-                    # Left‐ear TFs: ipsi vs contra
-                    ipsi_ir, contra_ir = data
-                    N = len(ipsi_ir)
-                    freqs = np.fft.fftfreq(N, d=1.0/self.samplerate)[:N//2]
-                    mag_ipsi = 20*np.log10(np.abs(np.fft.fft(ipsi_ir)[:N//2]) + 1e-12)
-                    mag_contra = 20*np.log10(np.abs(np.fft.fft(contra_ir)[:N//2]) + 1e-12)
-                    self.tf_curves[0][0].setData(freqs, mag_ipsi)
-                    self.tf_curves[0][1].setData(freqs, mag_contra)
-                elif i == 1:
-                    # Right‐ear TFs: ipsi vs contra
-                    ipsi_ir, contra_ir = data
-                    N = len(ipsi_ir)
-                    freqs = np.fft.fftfreq(N, d=1.0/self.samplerate)[:N//2]
-                    mag_ipsi = 20*np.log10(np.abs(np.fft.fft(ipsi_ir)[:N//2]) + 1e-12)
-                    mag_contra = 20*np.log10(np.abs(np.fft.fft(contra_ir)[:N//2]) + 1e-12)
-                    self.tf_curves[1][0].setData(freqs, mag_ipsi)
-                    self.tf_curves[1][1].setData(freqs, mag_contra)
-                else:
-                    # Filter IR plots remain in time domain
-                    t, ir = data
-                    self.tf_curves[i][0].setData(t, ir)
+            if not self.headtrack_checkbox.isChecked():
+                self.reload_filters()
+                lines = self.get_acoustics_data()
+                for i, data in enumerate(lines):
+                    if i == 0:
+                        # Left‐ear TFs: ipsi vs contra
+                        ipsi_ir, contra_ir = data
+                        N = len(ipsi_ir)
+                        freqs = np.fft.fftfreq(N, d=1.0/self.samplerate)[:N//2]
+                        mag_ipsi = 20*np.log10(np.abs(np.fft.fft(ipsi_ir)[:N//2]) + 1e-12)
+                        mag_contra = 20*np.log10(np.abs(np.fft.fft(contra_ir)[:N//2]) + 1e-12)
+                        self.tf_curves[0][0].setData(freqs, mag_ipsi)
+                        self.tf_curves[0][1].setData(freqs, mag_contra)
+                    elif i == 1:
+                        # Right‐ear TFs: ipsi vs contra
+                        ipsi_ir, contra_ir = data
+                        N = len(ipsi_ir)
+                        freqs = np.fft.fftfreq(N, d=1.0/self.samplerate)[:N//2]
+                        mag_ipsi = 20*np.log10(np.abs(np.fft.fft(ipsi_ir)[:N//2]) + 1e-12)
+                        mag_contra = 20*np.log10(np.abs(np.fft.fft(contra_ir)[:N//2]) + 1e-12)
+                        self.tf_curves[1][0].setData(freqs, mag_ipsi)
+                        self.tf_curves[1][1].setData(freqs, mag_contra)
+                    else:
+                        # Filter IR plots remain in time domain
+                        t, ir = data
+                        self.tf_curves[i][0].setData(t, ir)
 
 
         def reset_head(self):
@@ -1288,6 +1360,41 @@ def xtc_lab_processor():
 
             dialog.resize(800, 600)
             dialog.exec()
+
+        def calibrate_tracker(self):
+            self.head_rotation_offset = -self.head_yaw
+
+        def take_acoustics_measurements(self):
+            # 1. check / assert that the head tracker is connected and streaming
+            return
+
+        def toggle_headtracker(self, state):
+            self.headtracker_enabled = self.headtrack_checkbox.isChecked()
+            if self.headtracker_enabled:
+                print("[HeadTracker] Enabled, starting timer")
+                self.headtrack_timer.start()
+            else:
+                print("[HeadTracker] Disabled, stopping timer")
+                self.headtrack_timer.stop()
+
+        def osc_handler(self, address, *args):
+            # Expecting yaw as first argument
+            if args:
+                try:
+                    print(f"OSC message received: {address} with args {args}")
+                    if address == "/ypr":
+                        print(f"[HeadTracker] Yaw received: {args[0]}")
+                        self.head_yaw = -float(args[0])
+                except ValueError:
+                    pass
+
+        def update_headtrack(self):
+            print("[HeadTracker] Timer tick")
+            if self.headtracker_enabled:
+                print(f"[HeadTracker] Updating plot with yaw: {self.head_yaw}")
+                # Update head rotation and redraw top-down plot
+                self.head_rotation = self.head_yaw + self.head_rotation_offset
+                self.update_plot()
 
     # ---------------------------------------------
     # DraggablePlot

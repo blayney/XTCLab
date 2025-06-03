@@ -1,3 +1,5 @@
+from scipy.optimize import minimize
+from scipy.interpolate import interp1d
 import sounddevice as sd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -161,20 +163,14 @@ def align_impulse_responses(H_LL, H_LR, H_RL, H_RR, threshold_db=-60.0):
     import matplotlib.pyplot as plt
     plt.figure(figsize=(12, 6))
     plt.subplot(2, 1, 1)
-    plt.title("Before Alignment")
-    plt.plot(H_LL, label="H_LL")
-    plt.plot(H_LR, label="H_LR")
-    plt.plot(H_RL, label="H_RL")
-    plt.plot(H_RR, label="H_RR")
+    plt.title("IR Before Alignment")
+    plt.plot(np.arange(len(H_LL)), H_LL, 'o', label="IR")
     plt.legend()
     plt.grid()
 
     plt.subplot(2, 1, 2)
-    plt.title("After Alignment")
-    plt.plot(H_LL_new, label="H_LL_new")
-    plt.plot(H_LR_new, label="H_LR_new")
-    plt.plot(H_RL_new, label="H_RL_new")
-    plt.plot(H_RR_new, label="H_RR_new")
+    plt.title("IR After Alignment")
+    plt.plot(np.arange(len(H_LL_new)), H_LL_new, 'o', label="IR_Rolled")
     plt.legend()
     plt.grid()
     plt.tight_layout()
@@ -297,11 +293,17 @@ def extract_hrirs_sam(filepath, source_az, show_plots = False, attempt_interpola
         print(f"Interpolating HRIR for azimuth {source_az} degrees")
         source_az_floor = np.floor(source_az / 5) * 5
         source_az_ceil = np.ceil(source_az / 5) * 5
+        # Wrap around 360° to 0°
+        source_az_floor = source_az_floor % 360
+        source_az_ceil = source_az_ceil % 360
         if source_az_floor == source_az_ceil:
             idx = np.where((hrtf.locs[:,0] == source_az_floor) & (hrtf.locs[:,1] == 0))[0][0]
             hrir_l = hrtf.hrir[idx,0,:]
             hrir_r = hrtf.hrir[idx,1,:]
-            return hrir_l, hrir_r, hrtf.samplerate
+
+
+            samplerate = sofa.SOFAFile(filepath, 'r').getSamplingRate()
+            return hrir_l, hrir_r, samplerate
         print(f"Floor: {source_az_floor}, Ceil: {source_az_ceil}")
         # grab both HRIRs
         idx_floor = np.where((hrtf.locs[:,0] == source_az_floor) & (hrtf.locs[:,1] == 0))[0][0]
@@ -316,7 +318,7 @@ def extract_hrirs_sam(filepath, source_az, show_plots = False, attempt_interpola
         hrir_l_ceil_fft = np.fft.fft(hrir_l_ceil)
         hrir_r_ceil_fft = np.fft.fft(hrir_r_ceil)
         # interpolate L in frequency domain, acounting for position of source_az between floor and ceil
-        interp_factor = (source_az - source_az_floor) / (source_az_ceil - source_az_floor)
+        interp_factor = (source_az - source_az_floor) / ((source_az_ceil - source_az_floor) % 360 if (source_az_ceil - source_az_floor) % 360 != 0 else 5)
         hrir_l_fft = (1 - interp_factor) * hrir_l_floor_fft + interp_factor * hrir_l_ceil_fft
         hrir_r_fft = (1 - interp_factor) * hrir_r_floor_fft + interp_factor * hrir_r_ceil_fft
         # take IFFT to get time domain HRIRs
@@ -717,7 +719,7 @@ def generate_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, fi
     elif format=='FrequencyDomain':
         return FLL, FLR, FRL, FRR
 
-def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4):
+def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'):
     c = 343.0
     H_mat = np.array([[h_LL, h_LR], [h_RL, h_RR]])
 
@@ -784,6 +786,147 @@ def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position,
     FRL *= exp_L
     FRR *= exp_R
     return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
+def generate_kn_filter_smart(
+    h_LL, h_LR, h_RL, h_RR,
+    speaker_positions, head_position,
+    filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'
+):
+    from scipy.fft import fft, fftfreq
+    c = 343.0
+    H_mat = np.array([[h_LL, h_LR], [h_RL, h_RR]])
+
+    N = 2 ** int(np.ceil(np.log2(len(H_mat[0][0]) + filter_length - 1)))
+    omega = 2 * np.pi * fftfreq(N, d=1 / samplerate)
+    # Step 1: FFT of HRIRs
+    H_f = np.zeros((2, 2, N), dtype=complex)
+    for i in range(2):
+        for j in range(2):
+            H_f[i, j, :] = fft(H_mat[i][j], n=N)
+
+    delay_samples_l = int(np.round(np.linalg.norm(speaker_positions[0] - head_position) / c * samplerate))
+    delay_samples_r = int(np.round(np.linalg.norm(speaker_positions[1] - head_position) / c * samplerate))
+    if delay_samples_l == delay_samples_r:
+        print("Left and right sources are coherent, no delay applied")
+        tau_L = 0
+        tau_R = 0
+    elif delay_samples_l > delay_samples_r:
+        print("right source arrives first, applying delay to right")
+        tau_L = 0
+        tau_R = (delay_samples_l - delay_samples_r) / samplerate
+        print("applied {} seconds of delay to right".format(tau_R))
+    elif delay_samples_r > delay_samples_l:
+        print("left source arrives first, applying delay to left")
+        tau_L = (delay_samples_r - delay_samples_l) / samplerate
+        tau_R = 0
+        print("applied {} seconds of delay to left".format(tau_L))
+
+    if delay_samples_l != 0 or delay_samples_r != 0:
+        freqs = np.fft.fftfreq(N, d=1 / samplerate)
+        omega = 2 * np.pi * freqs
+        exp_L = np.exp(1j * omega * tau_L)  # for the left speaker
+        exp_R = np.exp(1j * omega * tau_R)  # for the right speaker
+        # Apply delays to the correct HRIR paths
+        H_f[0, 0, :] *= exp_L  # H_LL
+        H_f[0, 1, :] *= exp_R  # H_LR
+        H_f[1, 0, :] *= exp_L  # H_RL
+        H_f[1, 1, :] *= exp_R  # H_RR
+
+    # --- Helper functions for regularization optimization ---
+    def compute_filter_response(H_f, lambda_w):
+        N = H_f.shape[-1]
+        F_f = np.zeros_like(H_f)
+        for k in range(N):
+            Hk = H_f[:, :, k]
+            HkH = Hk @ Hk.conj().T
+            try:
+                inv_term = np.linalg.inv(HkH + lambda_w[k] * np.eye(2))
+                F_f[:, :, k] = Hk.conj().T @ inv_term
+            except np.linalg.LinAlgError:
+                F_f[:, :, k] = np.zeros((2, 2), dtype=complex)
+        return F_f
+    
+    def compute_regularization_error(log_lambdas, H_f, freqs, passband, beta=1.0):
+        # Interpolate log-scale lambda across frequency, with safe handling for nonpositive freqs
+        positive_freqs = freqs[freqs > 0]
+        control_freqs = np.geomspace(positive_freqs[0], positive_freqs[-1], len(log_lambdas))
+        lambda_interp_func = interp1d(np.log10(control_freqs), log_lambdas, kind='linear', fill_value="extrapolate")
+        # Safe interpolation: only for positive frequencies
+        log_lambda_w = np.full_like(freqs, fill_value=np.nan, dtype=float)
+        safe_mask = freqs > 0
+        log_lambda_w[safe_mask] = lambda_interp_func(np.log10(freqs[safe_mask]))
+        lambda_w = 10 ** log_lambda_w
+        # For negative/zero freqs, fallback to first positive value
+        if np.any(safe_mask):
+            lambda_w[~safe_mask] = lambda_w[safe_mask][0]
+        else:
+            lambda_w[:] = 1e-4  # fallback if no positive freqs (shouldn't happen)
+
+        F_f = compute_filter_response(H_f, lambda_w)
+        HF = np.einsum("ijk,jlk->ilk", H_f, F_f)  # H @ F
+
+        # Extract diagonal and off-diagonal elements
+        T_ipsi = np.abs(np.stack([HF[0, 0, :], HF[1, 1, :]]))
+        T_contra = np.abs(np.stack([HF[0, 1, :], HF[1, 0, :]]))
+
+        # Mask to passband only
+        T_ipsi = T_ipsi[:, passband]
+        T_contra = T_contra[:, passband]
+
+        flatness_error = np.mean((20 * np.log10(T_ipsi + 1e-12)) ** 2)
+        cancellation_error = np.mean(T_contra ** 2)
+
+        if np.any(np.isnan(HF)):
+            print("NaNs detected in HF matrix!")
+
+        return flatness_error + beta * cancellation_error
+
+    # Step 3: Frequency domain Kirkeby-Nelson inversion with optimized regularization profile
+    freqs = np.fft.fftfreq(N, d=1 / samplerate)
+    freq_mask = (freqs >= 100) & (freqs <= 7000)
+    init_log_lambda = np.full(8, np.log10(1e-4))
+
+    res = minimize(
+        compute_regularization_error,
+        init_log_lambda,
+        args=(H_f, freqs, freq_mask),
+        method='L-BFGS-B',
+        bounds=[(-8, 2)] * 8,
+        options={"maxiter": 50}
+    )
+
+    optimized_log_lambda = res.x
+    positive_freqs = freqs[freqs > 0]
+    control_freqs = np.geomspace(positive_freqs[0], positive_freqs[-1], len(optimized_log_lambda))
+    lambda_interp_func = interp1d(np.log10(control_freqs), optimized_log_lambda, kind='linear', fill_value="extrapolate")
+    # Safe interpolation: only for positive frequencies
+    log_lambda_w = np.full_like(freqs, fill_value=np.nan, dtype=float)
+    safe_mask = freqs > 0
+    log_lambda_w[safe_mask] = lambda_interp_func(np.log10(freqs[safe_mask]))
+    lambda_w = 10 ** log_lambda_w
+    if np.any(safe_mask):
+        lambda_w[~safe_mask] = lambda_w[safe_mask][0]
+    else:
+        lambda_w[:] = 1e-4
+
+    F_f = compute_filter_response(H_f, lambda_w)
+
+    FLL = F_f[0, 0, :]
+    FLR = F_f[0, 1, :]
+    FRL = F_f[1, 0, :]
+    FRR = F_f[1, 1, :]
+    # multiply by 700 sample delay.
+    delay_samples = -700
+    tau_L = delay_samples / samplerate
+    tau_R = delay_samples / samplerate
+    exp_L = np.exp(1j * omega * tau_L)    # for the left speaker
+    exp_R = np.exp(1j * omega * tau_R)    # for the right speaker
+    FLL *= exp_L
+    FLR *= exp_R
+    FRL *= exp_L
+    FRR *= exp_R
+    return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
 
 def plot_filter_surface(filter_coeffs, samplerate, title="Filter Surface"):
     import numpy as np
@@ -923,64 +1066,64 @@ def calibrate_amplitude(playback_channel, recording_channel, output_device, inpu
     print(f"Calibration failed to reach target level after {max_attempts} attempts. Using amplitude: {amplitude:.2f}")
     return amplitude
 
-def compute_rt60(ir, samplerate, noise_floor_region=(0, 0.05)):
+def compute_rt60(ir, samplerate):
+    """Estimate RT60 using the Schroeder backward integration method."""
+    if ir is None or len(ir) == 0:
+        return None
+
+    energy = ir ** 2
+    energy = energy / np.max(energy)  # Normalize
+
+    sch = np.cumsum(energy[::-1])[::-1]
+    sch_db = 10 * np.log10(sch + 1e-12)
+
+    print("Schroeder dB range:", sch_db.min(), sch_db.max())  # Debug output
+
+    # Relaxed thresholds to accommodate shallow decays
+    start_idx = np.argmax(sch_db < -2)
+    end_idx = np.argmax(sch_db < -20)
+
+    if end_idx <= start_idx or end_idx == 0:
+        return None
+
+    t = np.arange(len(sch_db)) / samplerate
+    slope, intercept = np.polyfit(t[start_idx:end_idx], sch_db[start_idx:end_idx], 1)
+
+    rt60 = -60 / slope if slope < 0 else None
+    return rt60
+
+def fft_noise_subtraction(signal, noise, floor_db=-120):
     """
-    Compute the RT60 (reverberation time) using the Schroeder backward integration method.
-    
-    Parameters:
-        ir (numpy array): Impulse response.
-        samplerate (int): Sampling rate of the IR.
-        noise_floor_region (tuple): Time range (in seconds) for estimating the noise floor.
-    
-    Returns:
-        float: Estimated RT60 in seconds.
+    Subtracts a noise spectrum from a signal in the frequency domain,
+    with robust protection against underflow, overflow, and invalid values.
     """
-    # Compute energy decay curve (Schroeder integral)
-    energy = np.cumsum(ir[::-1] ** 2)[::-1]  # Reverse cumulative sum of squared IR
-    energy_db = 10 * np.log10(energy / np.max(energy + 1e-9))  # Normalize and convert to dB
+    N = max(len(signal), len(noise))
+    sig_fft = np.fft.fft(signal, n=N)
+    noise_fft = np.fft.fft(noise, n=N)
 
-    # Estimate noise floor from the specified region
-    start_idx = int(noise_floor_region[0] * samplerate)
-    end_idx = int(noise_floor_region[1] * samplerate)
-    noise_floor_db = 10 * np.log10(np.mean(ir[start_idx:end_idx] ** 2) + 1e-9)
+    sig_mag = np.abs(sig_fft)
+    noise_mag = np.abs(noise_fft)
 
-    # Find RT60 by locating the -60 dB point
-    rt60_idx = np.where(energy_db <= noise_floor_db - 60)[0]
-    if len(rt60_idx) == 0:
-        return None  # Unable to compute RT60
-    rt60_time = rt60_idx[0] / samplerate
-    print(f"Estimated RT60: {rt60_time:.3f} seconds")
-    return rt60_time
+    # Safe noise floor epsilon in linear magnitude
+    try:
+        eps = 10 ** (floor_db / 20)
+        if not np.isfinite(eps) or eps < 1e-12:
+            eps = 1e-12
+    except OverflowError:
+        eps = 1e-12
 
-def fft_noise_subtraction(ir, noise_floor, samplerate, smoothing=0.1):
-    """
-    Perform spectral subtraction to remove noise from the IR using its noise floor.
-    
-    Parameters:
-        ir (numpy array): The impulse response.
-        noise_floor (numpy array): The noise floor (same length as IR).
-        samplerate (int): Sampling rate of the IR.
-        smoothing (float): Smoothing factor for the subtraction (0 to 1).
+    # Subtract noise spectrum magnitude
+    sub_mag = sig_mag - noise_mag
+    sub_mag = np.clip(sub_mag, eps, np.max(sig_mag))
 
-    Returns:
-        numpy array: Noise-reduced IR.
-    """
-    # Compute FFTs
-    ir_fft = np.fft.fft(ir)
-    noise_fft = np.fft.fft(noise_floor)
+    # Preserve original phase
+    sig_phase = np.angle(sig_fft)
 
-    # Subtract noise spectrum (with a smoothing factor)
-    mag_ir = np.abs(ir_fft)
-    mag_noise = np.abs(noise_fft)
-    phase_ir = np.angle(ir_fft)
+    # Reconstruct spectrum
+    sub_fft = sub_mag * np.exp(1j * sig_phase)
 
-    # Smoothed subtraction
-    reduced_mag = np.maximum(mag_ir - smoothing * mag_noise, 0)
-    ir_cleaned_fft = reduced_mag * np.exp(1j * phase_ir)
-
-    # Inverse FFT
-    ir_cleaned = np.fft.ifft(ir_cleaned_fft).real
-    return ir_cleaned
+    # Return real part of inverse FFT
+    return np.fft.ifft(sub_fft).real[:len(signal)]
 
 def post_process_ir_rt60(ir, samplerate, noise_floor_region=(0, 0.05), smoothing_factor=0.1):
     """
