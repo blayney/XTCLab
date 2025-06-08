@@ -1,3 +1,7 @@
+import numpy as np
+from math import sin, cos, radians
+from tqdm import tqdm
+import os
 from scipy.optimize import minimize
 from scipy.interpolate import interp1d
 import sounddevice as sd
@@ -273,6 +277,59 @@ def plot_hrtf_smaart_style_2x2(data, samplerate, azimuth=0):
     plt.show()
 
 def extract_hrirs_sam(filepath, source_az, show_plots = False, attempt_interpolate=False):
+    import os
+    cache_file = "hrir_cache_lookup.npz"
+    if not os.path.exists(cache_file):
+        print("Generating HRIR cache...")
+        hrtf = spatialaudiometrics.load_data.HRTF(filepath)
+        cache_dict = {}
+        for az in range(0, 360, 5):
+            idx = np.where((hrtf.locs[:, 0] == az) & (hrtf.locs[:, 1] == 0))[0]
+            if len(idx) > 0:
+                idx = idx[0]
+                hrir_l = hrtf.hrir[idx, 0, :]
+                hrir_r = hrtf.hrir[idx, 1, :]
+                cache_dict[f"{az}"] = (hrir_l, hrir_r)
+        np.savez(cache_file, **cache_dict)
+        print("HRIR cache saved.")
+
+    cache = np.load(cache_file, allow_pickle=True)
+    samplerate = sofa.SOFAFile(filepath, 'r').getSamplingRate()
+
+    source_az = source_az % 360
+    if not attempt_interpolate:
+        key = f"{int(round(source_az / 5) * 5) % 360}"
+        hrir_l, hrir_r = cache[key]
+    else:
+        floor_az = int(np.floor(source_az / 5) * 5) % 360
+        ceil_az = int(np.ceil(source_az / 5) * 5) % 360
+        if floor_az == ceil_az:
+            hrir_l, hrir_r = cache[f"{floor_az}"]
+        else:
+            hrir_l_floor, hrir_r_floor = cache[f"{floor_az}"]
+            hrir_l_ceil, hrir_r_ceil = cache[f"{ceil_az}"]
+            # Handle wrapping for interp_factor
+            az_diff = (ceil_az - floor_az) % 360
+            if az_diff == 0:
+                az_diff = 5
+            interp_factor = (source_az - floor_az) / az_diff
+            hrir_l = np.fft.ifft((1 - interp_factor) * np.fft.fft(hrir_l_floor) + interp_factor * np.fft.fft(hrir_l_ceil)).real
+            hrir_r = np.fft.ifft((1 - interp_factor) * np.fft.fft(hrir_r_floor) + interp_factor * np.fft.fft(hrir_r_ceil)).real
+
+    # if(show_plots):
+        # If you want to visualize, need to load HRTF for plotting
+        # hrtf = spatialaudiometrics.load_data.HRTF(filepath)
+        # fig,gs = spatialaudiometrics.visualisation.create_fig()
+        # axes = fig.add_subplot(gs[1:6,1:6])
+        # spatialaudiometrics.visualisation.plot_hrir_both_ears(hrtf,source_az,0,axes)
+        # axes = fig.add_subplot(gs[1:6,7:12])
+        # spatialaudiometrics.visualisation.plot_itd_overview(hrtf)
+        # spatialaudiometrics.visualisation.show()
+        # plt.show()
+    return hrir_l, hrir_r, samplerate
+
+
+def extract_hrirs_sam_uncache(filepath, source_az, show_plots = False, attempt_interpolate=False):
     # If we're not attempting to interpolate, round to the nearest 5 degrees
     print("attempting extraction")
     hrtf = spatialaudiometrics.load_data.HRTF(filepath)
@@ -477,7 +534,7 @@ def find_sofa_index_for_azimuth(sf, target_az_deg, tolerance=2.5):
 
     return best_idx
 
-def generate_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, filter_length=2048, samplerate=48000, debug=False, format='TimeDomain'):
+def generate_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, head_angle=None, filter_length=2048, samplerate=48000, debug=False, format='TimeDomain'):
     L = max(len(h_LL), len(h_LR), len(h_RL), len(h_RR))
     # how many points? more points = more frequency domain precision at the expense of time domain precision.
     M = filter_length
@@ -498,7 +555,7 @@ def generate_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, fi
     delay_samples_l = int(np.round(np.linalg.norm(speaker_positions[0] - head_position) / 343.0 * samplerate))
     delay_samples_r = int(np.round(np.linalg.norm(speaker_positions[1] - head_position) / 343.0 * samplerate))
     if delay_samples_l == delay_samples_r:
-        print("Left and right sources are coherent, no delay applied")
+        #print("Left and right sources are coherent, no delay applied")
         tau_L = 0
         tau_R = 0
     elif delay_samples_l > delay_samples_r:
@@ -713,13 +770,97 @@ def generate_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, fi
         plot_filter_surface(frr, samplerate, title="FRR Magnitude Surface")
     
     print("Filter lengths: ", len(fll), len(flr), len(frl), len(frr))
+    from scipy.signal import firwin
+    # Design FIR high-pass filter (match block processing)
+    numtaps_hp = 1025  # same as audio engine originally used
+    h_hp = firwin(numtaps_hp, cutoff=80.0, fs=samplerate, pass_zero=False)
+    # Zero-pad to length N
+    h_hp_padded = np.pad(h_hp, (0, N - numtaps_hp))
+    # FFT to get frequency response
+    H_hp = np.fft.fft(h_hp_padded, n=N)
+    # Multiply each filter's frequency response by the HP response
+    FLL = FLL * H_hp
+    FLR = FLR * H_hp
+    FRL = FRL * H_hp
+    FRR = FRR * H_hp
     if format=='TimeDomain':
         # Return time-domain filters
         return fll, flr, frl, frr
     elif format=='FrequencyDomain':
         return FLL, FLR, FRL, FRR
 
-def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'):
+
+
+
+import csv
+import os
+import numpy as np
+from collections import defaultdict
+
+# --- Memoization cache for generate_kn_filter ---
+filter_cache = None
+cache_stats = None
+cache_stats_file = "filter_cache_stats.csv"
+cache_tolerance = 0.2  # degrees
+
+def init_filter_cache():
+    global filter_cache, cache_stats
+    from collections import defaultdict
+    import os
+    import csv
+
+    filter_cache = {}
+    cache_stats = defaultdict(int)
+
+    if os.path.exists(cache_stats_file):
+        os.remove(cache_stats_file)
+    with open(cache_stats_file, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["TotalCalls", "CacheHits", "HitRate"])
+
+def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position, head_angle=None, filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'):
+
+    # Initialize cache if not already initialized
+    if filter_cache is None or cache_stats is None:
+        init_filter_cache()
+    # --- Memoization with best-match tolerance-based lookup using head position and angle ---
+    def get_azimuth(p1, p2):
+        delta = np.array(p2) - np.array(p1)
+        return np.degrees(np.arctan2(delta[1], delta[0])) % 360
+
+    az_L = get_azimuth(head_position, speaker_positions[0])
+    az_R = get_azimuth(head_position, speaker_positions[1])
+    key = (az_L, az_R, head_angle, head_position[0], head_position[1])
+
+    cache_stats["TotalCalls"] += 1
+
+    best_match = None
+    min_distance = float("inf")
+    for cached_key in filter_cache:
+        dL = abs((cached_key[0] - az_L + 180) % 360 - 180)
+        dR = abs((cached_key[1] - az_R + 180) % 360 - 180)
+        dA = abs((cached_key[2] - head_angle + 180) % 360 - 180)
+        dX = abs(cached_key[3] - head_position[0])
+        dY = abs(cached_key[4] - head_position[1])
+        distance = max(dL, dR, dA, dX, dY)
+        # print(f"[DEBUG] Comparing to cached key: L = {cached_key[0]:.2f}, R = {cached_key[1]:.2f}, A = {cached_key[2]:.2f}, X = {cached_key[3]:.2f}, Y = {cached_key[4]:.2f}")
+        # print(f"[DEBUG] dL = {dL:.2f}, dR = {dR:.2f}, dA = {dA:.2f}, dX = {dX:.2f}, dY = {dY:.2f}")
+        if distance < min_distance:
+            min_distance = distance
+            best_match = cached_key
+
+    if best_match is not None and min_distance <= cache_tolerance:
+        # print(f"[DEBUG] Cache hit: Using cached filter for key {best_match}")
+        cache_stats["CacheHits"] += 1
+        hit_rate = cache_stats["CacheHits"] / cache_stats["TotalCalls"]
+        with open(cache_stats_file, mode="a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow([cache_stats["TotalCalls"], cache_stats["CacheHits"], f"{hit_rate:.4f}"])
+        return filter_cache[best_match]
+    else:
+        print(f"[DEBUG] Cache miss or outside tolerance (min_distance = {min_distance:.2f}); generating new filter.")
+
+    from scipy.fft import fft, fftfreq
     c = 343.0
     H_mat = np.array([[h_LL, h_LR], [h_RL, h_RR]])
 
@@ -735,7 +876,7 @@ def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position,
     delay_samples_l = int(np.round(np.linalg.norm(speaker_positions[0] - head_position) / 343.0 * samplerate))
     delay_samples_r = int(np.round(np.linalg.norm(speaker_positions[1] - head_position) / 343.0 * samplerate))
     if delay_samples_l == delay_samples_r:
-        print("Left and right sources are coherent, no delay applied")
+        # print("Left and right sources are coherent, no delay applied")
         tau_L = 0
         tau_R = 0
     elif delay_samples_l > delay_samples_r:
@@ -785,11 +926,129 @@ def generate_kn_filter(h_LL, h_LR, h_RL, h_RR, speaker_positions, head_position,
     FLR *= exp_R
     FRL *= exp_L
     FRR *= exp_R
+
+    # Store in cache and log stats
+    filter_cache[key] = (FLL, FLR, FRL, FRR)
+    hit_rate = cache_stats["CacheHits"] / cache_stats["TotalCalls"]
+    with open(cache_stats_file, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([cache_stats["TotalCalls"], cache_stats["CacheHits"], f"{hit_rate:.4f}"])
+
+    from scipy.signal import firwin
+    # Design FIR high-pass filter (match block processing)
+    numtaps_hp = 1025  # same as audio engine originally used
+    h_hp = firwin(numtaps_hp, cutoff=80.0, fs=samplerate, pass_zero=False)
+    # Zero-pad to length N
+    h_hp_padded = np.pad(h_hp, (0, N - numtaps_hp))
+    # FFT to get frequency response
+    H_hp = np.fft.fft(h_hp_padded, n=N)
+    # Multiply each filter's frequency response by the HP response
+    FLL = FLL * H_hp
+    FLR = FLR * H_hp
+    FRL = FRL * H_hp
+    FRR = FRR * H_hp
     return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
+def generate_real_kn_filter(
+    h_LL, h_LR, h_RL, h_RR,
+    filter_length=16384, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'
+):
+    from scipy.fft import fft, fftfreq
+    c = 343.0
+    H_mat = np.array([[h_LL, h_LR], [h_RL, h_RR]])
+
+    N = 2**int(np.ceil(np.log2(len(H_mat[0][0]) + filter_length - 1)))
+    omega = 2 * np.pi * fftfreq(N, d=1/samplerate)
+    # Step 1: FFT of HRIRs
+    H_f = np.zeros((2, 2, N), dtype=complex)
+
+    for i in range(2):
+        for j in range(2):
+            H_f[i, j, :] = fft(H_mat[i][j], n=N)
+    
+    # Step 3: Frequency domain Kirkeby-Nelson inversion
+    F_f = np.zeros((2, 2, N), dtype=complex)
+    for k in range(N):
+        Hk = H_f[:, :, k]
+        Hk_H = Hk.conj().T
+        lambda_k = lambda_freq if np.isscalar(lambda_freq) else lambda_freq(k, N)
+        inv = np.linalg.inv(Hk_H @ Hk + lambda_k * np.eye(2)) @ Hk_H
+        F_f[:, :, k] = inv  # targeting D = identity matrix
+
+    FLL = F_f[0, 0, :]
+    FLR = F_f[0, 1, :]
+    FRL = F_f[1, 0, :]
+    FRR = F_f[1, 1, :]
+    # multiply by 700 sample delay.
+    delay_samples = -700
+    tau_L = delay_samples / samplerate
+    tau_R = delay_samples / samplerate
+    exp_L = np.exp(1j * omega * tau_L)    # for the left speaker
+    exp_R = np.exp(1j * omega * tau_R)    # for the right speaker
+    FLL *= exp_L
+    FLR *= exp_R
+    FRL *= exp_L
+    FRR *= exp_R
+
+    # Store in cache and log stats
+    return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
+
+def generate_real_kn_filter_fd(
+    H_LL, H_LR, H_RL, H_RR,
+    filter_length=16384, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'
+):
+    from scipy.fft import fft, fftfreq
+    filter_length = len(H_LL)  # Use the length of the provided HRIRs
+    N = filter_length  # Use the provided filter length directly
+    H_f = np.array([[H_LL, H_LR], [H_RL, H_RR]])
+    
+    # Step 3: Frequency domain Kirkeby-Nelson inversion
+    F_f = np.zeros((2, 2, N), dtype=complex)
+    for k in range(N):
+        Hk = H_f[:, :, k]
+        Hk_H = Hk.conj().T
+        lambda_k = lambda_freq if np.isscalar(lambda_freq) else lambda_freq(k, N)
+        inv = np.linalg.inv(Hk_H @ Hk + lambda_k * np.eye(2)) @ Hk_H
+        F_f[:, :, k] = inv  # targeting D = identity matrix
+
+    FLL = F_f[0, 0, :]
+    FLR = F_f[0, 1, :]
+    FRL = F_f[1, 0, :]
+    FRR = F_f[1, 1, :]
+    # multiply by 700 sample delay.
+    delay_samples = -700
+    omega = 2 * np.pi * fftfreq(N, d=1/samplerate)
+    tau_L = delay_samples / samplerate
+    tau_R = delay_samples / samplerate
+    exp_L = np.exp(1j * omega * tau_L)    # for the left speaker
+    exp_R = np.exp(1j * omega * tau_R)    # for the right speaker
+    # FLL *= exp_L
+    # FLR *= exp_R
+    # FRL *= exp_L
+    # FRR *= exp_R
+    # bandpass filter
+    bpfilter = np.zeros(N, dtype=complex)
+    freqs = np.fft.fftfreq(N, d=1/samplerate)
+    for i in range(N):
+        if 400 <= abs(freqs[i]) <= 13000:
+            bpfilter[i] = 1.0
+        else:
+            bpfilter[i] = 0.0
+    
+    FLL *= bpfilter
+    FLR *= bpfilter
+    FRL *= bpfilter
+    FRR *= bpfilter
+
+    # Store in cache and log stats
+    return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
+
 
 def generate_kn_filter_smart(
     h_LL, h_LR, h_RL, h_RR,
-    speaker_positions, head_position,
+    speaker_positions, head_position, head_angle=None,
     filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'
 ):
     from scipy.fft import fft, fftfreq
@@ -926,6 +1185,110 @@ def generate_kn_filter_smart(
     FRL *= exp_L
     FRR *= exp_R
     return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
+def generate_real_kn_filter_smart(
+    h_LL, h_LR, h_RL, h_RR,
+    filter_length=2048, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'
+):
+    print("Generating real Kirkeby-Nelson filter with smart optimization...")
+    from scipy.fft import fft, fftfreq
+    c = 343.0
+    H_mat = np.array([[h_LL, h_LR], [h_RL, h_RR]])
+
+    N = 2 ** int(np.ceil(np.log2(len(H_mat[0][0]) + filter_length - 1)))
+    omega = 2 * np.pi * fftfreq(N, d=1 / samplerate)
+    # Step 1: FFT of HRIRs
+    H_f = np.zeros((2, 2, N), dtype=complex)
+    for i in range(2):
+        for j in range(2):
+            H_f[i, j, :] = fft(H_mat[i][j], n=N)
+
+    # --- Helper functions for regularization optimization ---
+    def compute_filter_response(H_f, lambda_w):
+        N = H_f.shape[-1]
+        F_f = np.zeros_like(H_f)
+        for k in range(N):
+            Hk = H_f[:, :, k]
+            HkH = Hk @ Hk.conj().T
+            try:
+                inv_term = np.linalg.inv(HkH + lambda_w[k] * np.eye(2))
+                F_f[:, :, k] = Hk.conj().T @ inv_term
+            except np.linalg.LinAlgError:
+                F_f[:, :, k] = np.zeros((2, 2), dtype=complex)
+        return F_f
+    
+    def compute_regularization_error(log_lambdas, H_f, freqs, passband, beta=1.0):
+        # Interpolate log-scale lambda across frequency, with safe handling for nonpositive freqs
+        positive_freqs = freqs[freqs > 0]
+        control_freqs = np.geomspace(positive_freqs[0], positive_freqs[-1], len(log_lambdas))
+        lambda_interp_func = interp1d(np.log10(control_freqs), log_lambdas, kind='linear', fill_value="extrapolate")
+        # Safe interpolation: only for positive frequencies
+        log_lambda_w = np.full_like(freqs, fill_value=np.nan, dtype=float)
+        safe_mask = freqs > 0
+        log_lambda_w[safe_mask] = lambda_interp_func(np.log10(freqs[safe_mask]))
+        lambda_w = 10 ** log_lambda_w
+        # For negative/zero freqs, fallback to first positive value
+        if np.any(safe_mask):
+            lambda_w[~safe_mask] = lambda_w[safe_mask][0]
+        else:
+            lambda_w[:] = 1e-4  # fallback if no positive freqs (shouldn't happen)
+
+        F_f = compute_filter_response(H_f, lambda_w)
+        HF = np.einsum("ijk,jlk->ilk", H_f, F_f)  # H @ F
+
+        # Extract diagonal and off-diagonal elements
+        T_ipsi = np.abs(np.stack([HF[0, 0, :], HF[1, 1, :]]))
+        T_contra = np.abs(np.stack([HF[0, 1, :], HF[1, 0, :]]))
+
+        # Mask to passband only
+        T_ipsi = T_ipsi[:, passband]
+        T_contra = T_contra[:, passband]
+
+        flatness_error = np.mean((20 * np.log10(T_ipsi + 1e-12)) ** 2)
+        cancellation_error = np.mean(T_contra ** 2)
+
+        if np.any(np.isnan(HF)):
+            print("NaNs detected in HF matrix!")
+
+        return flatness_error + beta * cancellation_error
+
+    # Step 3: Frequency domain Kirkeby-Nelson inversion with optimized regularization profile
+    freqs = np.fft.fftfreq(N, d=1 / samplerate)
+    freq_mask = (freqs >= 100) & (freqs <= 7000)
+    init_log_lambda = np.full(8, np.log10(1e-4))
+    print("Optimizing regularization parameters...")
+    res = minimize(
+        compute_regularization_error,
+        init_log_lambda,
+        args=(H_f, freqs, freq_mask),
+        method='L-BFGS-B',
+        bounds=[(-8, 2)] * 8,
+        options={"maxiter": 25}
+    )
+    print("Optimization complete.")
+
+    optimized_log_lambda = res.x
+    positive_freqs = freqs[freqs > 0]
+    control_freqs = np.geomspace(positive_freqs[0], positive_freqs[-1], len(optimized_log_lambda))
+    lambda_interp_func = interp1d(np.log10(control_freqs), optimized_log_lambda, kind='linear', fill_value="extrapolate")
+    # Safe interpolation: only for positive frequencies
+    log_lambda_w = np.full_like(freqs, fill_value=np.nan, dtype=float)
+    safe_mask = freqs > 0
+    log_lambda_w[safe_mask] = lambda_interp_func(np.log10(freqs[safe_mask]))
+    lambda_w = 10 ** log_lambda_w
+    if np.any(safe_mask):
+        lambda_w[~safe_mask] = lambda_w[safe_mask][0]
+    else:
+        lambda_w[:] = 1e-4
+
+    F_f = compute_filter_response(H_f, lambda_w)
+
+    FLL = F_f[0, 0, :]
+    FLR = F_f[0, 1, :]
+    FRL = F_f[1, 0, :]
+    FRR = F_f[1, 1, :]
+    return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
 
 
 def plot_filter_surface(filter_coeffs, samplerate, title="Filter Surface"):
@@ -1390,3 +1753,65 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+# --- Helper function to generate cache statistics plot ---
+
+def generate_cache_stats_plot():
+    import matplotlib.pyplot as plt
+    import csv
+    import os
+    global cache_stats_file
+    if not os.path.exists(cache_stats_file):
+        print("[DEBUG] No cache stats file found.")
+        return
+
+    total_calls = []
+    hit_rates = []
+
+    with open(cache_stats_file, newline="") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            total_calls.append(int(row["TotalCalls"]))
+            hit_rates.append(float(row["HitRate"]))
+
+    if total_calls and hit_rates:
+        plt.figure(figsize=(8, 4))
+        plt.plot(total_calls, hit_rates, marker='o')
+        plt.xlabel("Total Calls")
+        plt.ylabel("Cache Hit Rate")
+        plt.title("Filter Cache Hit Rate Over Time")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("filter_cache_stats.png")
+        print("[DEBUG] Cache statistics plot saved as filter_cache_stats.png")
+
+
+
+def get_prerendered_filter(angle):
+    """
+    Load the cached filters and interpolate between adjacent angles if needed.
+    Returns (FLL, FLR, FRL, FRR) for the requested angle (can be fractional).
+    """
+    from scipy.interpolate import interp1d
+
+    if not os.path.exists("prerendered_filters.npz"):
+        raise FileNotFoundError("prerendered_filters.npz not found. Run prerender_filters() first.")
+
+    data = np.load("prerendered_filters.npz", allow_pickle=True)
+    angle_floor = int(np.floor(angle)) % 360
+    angle_ceil = int(np.ceil(angle)) % 360
+    weight = angle - angle_floor
+
+    def load_components(a):
+        f = data[str(a)].item()
+        return f['FLL'], f['FLR'], f['FRL'], f['FRR']
+
+    FLL0, FLR0, FRL0, FRR0 = load_components(angle_floor)
+    FLL1, FLR1, FRL1, FRR1 = load_components(angle_ceil)
+
+    FLL = (1 - weight) * FLL0 + weight * FLL1
+    FLR = (1 - weight) * FLR0 + weight * FLR1
+    FRL = (1 - weight) * FRL0 + weight * FRL1
+    FRR = (1 - weight) * FRR0 + weight * FRR1
+
+    return FLL, FLR, FRL, FRR

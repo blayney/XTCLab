@@ -11,25 +11,47 @@
 # HRIR from the dataset.
 #
 
+import os
+import time
 import numpy as np
 import random
 #from pythonosc.udp_client import SimpleUDPClient
 import threading
 import sounddevice as sd
 import pyqtgraph as pg
-import os
 from pyqtgraph.Qt import QtWidgets, QtCore
 from PyQt6.QtWidgets import QApplication, QMainWindow, QDockWidget, QComboBox, QLabel, QPushButton
 from PyQt6.QtCore import Qt, QTimer
 from pythonosc import dispatcher, osc_server
-import threading
 from scipy.fft import fft
+from scipy.signal import fftconvolve
 from scipy.interpolate import interp1d
 from math import sin, cos, radians
+import matplotlib.pyplot as plt
+from scipy.signal import oaconvolve
 import xtc
+import atexit
+atexit.register(xtc.generate_cache_stats_plot)
+xtc.init_filter_cache()
 import level_meter
 from audio_engine import AudioEngine
-import matplotlib.pyplot as plt
+
+# --- Patch: Import wavwrite for saving WAV files ---
+from scipy.io.wavfile import write as wavwrite
+
+
+# Import the stimulus module for sweep generation and deconvolution
+
+import stimulus
+try:
+    from scipy.signal.windows import tukey
+    stimulus.signal.tukey = tukey
+except ImportError:
+    pass
+
+# --- Patch: Import utils for audio play/record ---
+import utils
+
 
 
 def list_audio_outputs():
@@ -68,11 +90,11 @@ def xtc_lab_processor():
     # Geometry & Setup
     # ----------------------------------------------------
     distance_l = 1.5
-    distance_r = 2
-    left_az_deg = -30.0
-    right_az_deg = 10.0
+    distance_r = 1.5
+    left_az_deg = -25.6
+    right_az_deg = 25.6
 
-    head_position = np.array([1.0, 2.0])
+    head_position = np.array([1.0, 1.0])
     scale_factor = 100.0
     c = 343.0  # Speed of sound
 
@@ -104,7 +126,9 @@ def xtc_lab_processor():
                     "binaural_left_channel": 0,
                     "binaural_right_channel": 1,
                     "measurement_device": "...",
-                    "measurement_channel": 0,
+                    "measurement_left_channel": 0,
+                    "measurement_right_channel": 1,
+                    "reference_channel": 4,
                     "playback_device": "...",
                     "playback_left_channel": 0,
                     "playback_right_channel": 1,
@@ -134,6 +158,12 @@ def xtc_lab_processor():
             self.flr = None
             self.frl = None
             self.frr = None
+
+            self.real_hrirs_mode = True
+            
+            self.LSPKTF = None
+            self.RSPKTF = None
+
             self.current_sofa_file = None
             self.regularization = 0.01
             if os.path.exists("regularization_profile.json"):
@@ -384,15 +414,15 @@ def xtc_lab_processor():
             settings_button = QtWidgets.QPushButton("Settings")
             settings_button.clicked.connect(self.open_settings_menu)
             center_layout.addWidget(settings_button)
-            geometry_button = QtWidgets.QPushButton("Geometry Setup")
-            geometry_button.clicked.connect(self.open_geometry_menu)
-            center_layout.addWidget(geometry_button)
+            grab_hrirs = QtWidgets.QPushButton("Measure and Invert")
+            grab_hrirs.clicked.connect(self.grab_hrirs)
+            center_layout.addWidget(grab_hrirs)
 
             inspect_hrir_button = QtWidgets.QPushButton("Inspect HRIRs")
             inspect_hrir_button.clicked.connect(self.open_hrir_inspection_modal)
             center_layout.addWidget(inspect_hrir_button)
 
-            zero_head_angle = QtWidgets.QPushButton("Generate Filter Statistics")
+            zero_head_angle = QtWidgets.QPushButton("Zero Head Tracker")
             zero_head_angle.clicked.connect(self.calibrate_tracker)
             center_layout.addWidget(zero_head_angle)
 
@@ -405,6 +435,7 @@ def xtc_lab_processor():
             center_layout.addWidget(self.filter_design_dropdown)
 
             self.bypass_checkbox = QtWidgets.QCheckBox("Bypass Filters")
+            self.bypass_checkbox.setChecked(True)
             self.bypass_checkbox.stateChanged.connect(self.toggle_bypass)
             center_layout.addWidget(self.bypass_checkbox)
 
@@ -528,13 +559,26 @@ def xtc_lab_processor():
                 except Exception:
                     pass
             with self.filter_lock:
+                # If frequency domain filters are available, convert to time domain for AudioEngine
+                if self.FLL is not None:
+                    # Recover full time-domain filters (preserving phase and delay)
+                    f11 = np.real(np.fft.ifft(self.FLL))
+                    f12 = np.real(np.fft.ifft(self.FLR))
+                    f21 = np.real(np.fft.ifft(self.FRL))
+                    f22 = np.real(np.fft.ifft(self.FRR))
+                    print("Passing time-domain filters to AudioEngine")
+                else:
+                    f11 = self.fll
+                    f12 = self.flr
+                    f21 = self.frl
+                    f22 = self.frr
                 self.audio_engine = AudioEngine(
                     config=self.config,
                     meter_callback=self.update_meters,
-                    f11=self.fll,
-                    f12=self.flr,
-                    f21=self.frl,
-                    f22=self.frr,
+                    f11=f11,
+                    f12=f12,
+                    f21=f21,
+                    f22=f22,
                     bypass=self.bypass_checkbox.isChecked()
                 )
 
@@ -579,7 +623,9 @@ def xtc_lab_processor():
             # Channel selectors
             binaural_left_combo = QComboBox()
             binaural_right_combo = QComboBox()
-            mic_combo = QComboBox()
+            reference_mic_combo = QComboBox()
+            ear_mic_left_combo = QComboBox()
+            ear_mic_right_combo = QComboBox()
             playback_left_combo = QComboBox()
             playback_right_combo = QComboBox()
 
@@ -589,8 +635,14 @@ def xtc_lab_processor():
             layout.addWidget(QLabel("Select Binaural Right Channel:"))
             layout.addWidget(binaural_right_combo)
 
-            layout.addWidget(QLabel("Select Microphone Channel:"))
-            layout.addWidget(mic_combo)
+            layout.addWidget(QLabel("Select Left Ear Microphone Channel:"))
+            layout.addWidget(ear_mic_left_combo)
+
+            layout.addWidget(QLabel("Select Right Ear Microphone Channel:"))
+            layout.addWidget(ear_mic_right_combo)
+
+            layout.addWidget(QLabel("Select Reference Microphone Channel:"))
+            layout.addWidget(reference_mic_combo)
 
             layout.addWidget(QLabel("Select Playback Left Channel:"))
             layout.addWidget(playback_left_combo)
@@ -627,7 +679,7 @@ def xtc_lab_processor():
 
             # Connect combo boxes to populate respective channels
             binaural_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, [binaural_left_combo, binaural_right_combo], is_input=True))
-            measurement_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, mic_combo, is_input=True))
+            measurement_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, [ear_mic_left_combo, ear_mic_right_combo, reference_mic_combo], is_input=True))
             playback_device_combo.currentTextChanged.connect(lambda name: populate_channels(name, [playback_left_combo, playback_right_combo], is_input=False))
 
             # Save button
@@ -640,7 +692,9 @@ def xtc_lab_processor():
                     "binaural_left_channel": binaural_left_combo.currentData(),
                     "binaural_right_channel": binaural_right_combo.currentData(),
                     "measurement_device": measurement_device_combo.currentText(),
-                    "measurement_channel": mic_combo.currentData(),
+                    "measurement_left_channel": ear_mic_left_combo.currentData(),
+                    "measurement_right_channel": ear_mic_right_combo.currentData(),
+                    "reference_channel": reference_mic_combo.currentData(),
                     "playback_device": playback_device_combo.currentText(),
                     "playback_left_channel": playback_left_combo.currentData(),
                     "playback_right_channel": playback_right_combo.currentData(),
@@ -666,15 +720,17 @@ def xtc_lab_processor():
             playback_device_combo.setCurrentText(self.config["playback_device"])
 
             populate_channels(self.config["binaural_device"], [binaural_left_combo, binaural_right_combo], is_input=True)
-            populate_channels(self.config["measurement_device"], mic_combo, is_input=True)
+            populate_channels(self.config["measurement_device"], [ear_mic_left_combo, ear_mic_right_combo, reference_mic_combo], is_input=True)
             populate_channels(self.config["playback_device"], [playback_left_combo, playback_right_combo], is_input=False)
 
-            binaural_left_combo.setCurrentIndex(self.config["binaural_left_channel"] or 0)
-            binaural_right_combo.setCurrentIndex(self.config["binaural_right_channel"] or 0)
-            mic_combo.setCurrentIndex(self.config["measurement_channel"] or 0)
-            playback_left_combo.setCurrentIndex(self.config["playback_left_channel"] or 0)
-            playback_right_combo.setCurrentIndex(self.config["playback_right_channel"] or 0)
-            hrtf_combo.setCurrentText(self.config["hrtf_file"])
+            binaural_left_combo.setCurrentIndex(self.config.get("binaural_left_channel", 0))
+            binaural_right_combo.setCurrentIndex(self.config.get("binaural_right_channel", 0))
+            ear_mic_left_combo.setCurrentIndex(self.config.get("measurement_left_channel", 0))
+            ear_mic_right_combo.setCurrentIndex(self.config.get("measurement_right_channel", 0))
+            reference_mic_combo.setCurrentIndex(self.config.get("reference_channel", 0))
+            playback_left_combo.setCurrentIndex(self.config.get("playback_left_channel", 0))
+            playback_right_combo.setCurrentIndex(self.config.get("playback_right_channel", 0))
+            hrtf_combo.setCurrentText(self.config.get("hrtf_file", ""))
 
             settings_dialog.exec()
 
@@ -741,37 +797,41 @@ def xtc_lab_processor():
 
 
         def reload_filters(self, format='FrequencyDomain'):
-            try:
-                left_az_deg, right_az_deg = self.get_azimuth_pair()                
-                HRIR_LL, HRIR_RL, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg, show_plots=False, attempt_interpolate=True) # Left speaker left ear, Left speaker right ear
-                HRIR_LR, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg, show_plots=False, attempt_interpolate=True) 
-                self.hll = HRIR_LL
-                self.hlr = HRIR_LR
-                self.hrl = HRIR_RL
-                self.hrr = HRIR_RR
+            if not self.real_hrirs_mode:
+                try:
+                    left_az_deg, right_az_deg = self.get_azimuth_pair()  
+                    # ear, speaker              
+                    HRIR_LL, HRIR_RL, sample_rate_l = xtc.extract_hrirs_sam(self.current_sofa_file, left_az_deg, show_plots=False, attempt_interpolate=True) # Left speaker left ear, Left speaker right ear
+                    HRIR_LR, HRIR_RR, sample_rate_r = xtc.extract_hrirs_sam(self.current_sofa_file, right_az_deg, show_plots=False, attempt_interpolate=True) 
+                    self.hll = HRIR_LL
+                    self.hlr = HRIR_LR
+                    self.hrl = HRIR_RL
+                    self.hrr = HRIR_RR
 
-                assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
-                self.samplerate = sample_rate_l[0]
-                H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
-                if self.filter_design_dropdown.currentText() == "Kirkeby Nelson Constant Reg":
-                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
-                elif self.filter_design_dropdown.currentText() == "Kirkeby Nelson Smart":
-                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter_smart(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
-                else:
-                    if format=='TimeDomain':
-                        self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
-                        # Debug: report raw filter peak magnitudes
-                        print(f"Filter peaks (raw): fll={np.max(np.abs(self.fll)):.3f}, flr={np.max(np.abs(self.flr)):.3f}, frl={np.max(np.abs(self.frl)):.3f}, frr={np.max(np.abs(self.frr)):.3f}")
-                        print("Filters reloaded successfully.")
-                        # invalidate filters in omega
-                        self.FLL = self.FLR = self.FRL = self.FRR = None
+                    assert sample_rate_l == sample_rate_r, "Sample rates do not match!"
+                    self.samplerate = sample_rate_l[0]
+                    H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
+                    if self.filter_design_dropdown.currentText() == "Kirkeby Nelson Constant Reg":
+                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, self.head_rotation, filter_length=2048, samplerate=self.samplerate, debug=True)
+                    elif self.filter_design_dropdown.currentText() == "Kirkeby Nelson Smart":
+                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter_smart(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=True)
                     else:
-                        self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
-                        print("Filters reloaded successfully.")
-                        # invalidate filters in time
-                        self.fll = self.flr = self.frl = self.frr = None
-            except Exception as e:
-                print(f"Error loading default filters: {e}")
+                        if format=='TimeDomain':
+                            self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
+                            # Debug: report raw filter peak magnitudes
+                            print(f"Filter peaks (raw): fll={np.max(np.abs(self.fll)):.3f}, flr={np.max(np.abs(self.flr)):.3f}, frl={np.max(np.abs(self.frl)):.3f}, frr={np.max(np.abs(self.frr)):.3f}")
+                            print("Filters reloaded successfully.")
+                            # invalidate filters in omega
+                            self.FLL = self.FLR = self.FRL = self.FRR = None
+                        else:
+                            self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
+                            print("Filters reloaded successfully.")
+                            # invalidate filters in time
+                            self.fll = self.flr = self.frl = self.frr = None
+
+                    self.update_audio_engine()
+                except Exception as e:
+                    print(f"Error loading default filters: {e}")
                 
                 
         def load_default_filters(self, format='FrequencyDomain'):
@@ -794,7 +854,7 @@ def xtc_lab_processor():
                 self.samplerate = sample_rate_l[0]
                 H_LL, H_LR, H_RL, H_RR = HRIR_LL, HRIR_LR, HRIR_RL, HRIR_RR
                 if self.filter_design_dropdown.currentText() == "Kirkeby Nelson":
-                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False)
+                    self.FLL, self.FLR, self.FRL, self.FRR = xtc.generate_kn_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, self.head_rotation, filter_length=2048, samplerate=self.samplerate, debug=False)
                 else:
                     if format=='TimeDomain':
                         self.fll, self.flr, self.frl, self.frr = xtc.generate_filter(H_LL, H_LR, H_RL, H_RR, original_speaker_positions, head_position, filter_length=2048, samplerate=self.samplerate, debug=False, format=format)
@@ -1027,6 +1087,541 @@ def xtc_lab_processor():
 
             return xvals, yvals, energy_map
         
+        def grab_hrirs(self):
+            # Create results directory
+            results_dir = os.path.join("results", "reality_inversions_kn")
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
+
+            # Helper: Modal countdown dialog
+            def show_countdown_dialog(message, seconds):
+                dlg = QtWidgets.QDialog(self)
+                dlg.setWindowTitle("Countdown")
+                layout = QtWidgets.QVBoxLayout(dlg)
+                label = QtWidgets.QLabel(message)
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(label)
+                countdown_label = QtWidgets.QLabel("")
+                countdown_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(countdown_label)
+                dlg.setModal(True)
+                dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+                dlg.setFixedSize(300, 120)
+                def update_countdown(n):
+                    countdown_label.setText(f"{n}")
+                for i in reversed(range(1, seconds+1)):
+                    update_countdown(i)
+                    QtWidgets.QApplication.processEvents()
+                    time.sleep(1)
+                dlg.accept()
+                dlg.close()
+
+            # Helper: Modal ready dialog with GO button
+            def show_ready_dialog(message):
+                dlg = QtWidgets.QDialog(self)
+                dlg.setWindowTitle("Ready")
+                layout = QtWidgets.QVBoxLayout(dlg)
+                label = QtWidgets.QLabel(message)
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(label)
+                go_button = QtWidgets.QPushButton("GO")
+                layout.addWidget(go_button)
+                dlg.setModal(True)
+                dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+                dlg.setFixedSize(300, 120)
+                go_button.clicked.connect(dlg.accept)
+                dlg.exec()
+                dlg.close()
+
+            # --- Step 1: Generate Farina sweep and inverse filter using stimulus class ---
+            import matplotlib.pyplot as plt
+            # Ensure results directory for plots exists
+            results_dir = os.path.join("results", "reality_inversions_kn")
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
+            # Placeholders for full deconvolved IRs (first sweep)
+            full_RIRs_L = None
+            full_RIRs_R = None
+            samplerate = 48000
+            sweep_duration = 5  # Use integer seconds for sweep_duration for compatibility with stimulus class and sounddevice
+            sweep_len = int(samplerate * sweep_duration)
+            n_sweeps = 1
+            hrir_len = 32768
+            start_freq = 20.0
+            end_freq = 20000.0
+
+            filter_length_samples = 16384  # Length of the filter to be generated
+
+            testStimulus = stimulus.stimulus('sinesweep', samplerate)
+            # amplitude=1.0, single repetition, no silence before/after
+            testStimulus.generate(samplerate, sweep_duration, 1.0, 1, 0, 0, (start_freq, end_freq))
+            sweep = testStimulus.signal.flatten()
+            start_idx = len(sweep) - 1
+
+            # Prepare device indices once
+            devices = sd.query_devices()
+            in_dev_idx = next(i for i, d in enumerate(devices) if d['name'] == self.config["measurement_device"])
+            out_dev_idx = next(i for i, d in enumerate(devices) if d['name'] == self.config["playback_device"])
+            sd.default.device = (in_dev_idx, out_dev_idx)
+
+            # Ensure results directory exists for saving raw sweeps
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
+
+            # Step 2: Record and extract 2×2 HRIRs
+            show_ready_dialog("Press go to record.")
+            # Left speaker to both ears
+            H_LL_raws, H_RL_raws = [], []
+            for idx in range(n_sweeps):
+                out = np.zeros((sweep_len, 2))
+
+                out[:, 0] = sweep
+                # out[:, 0] *= 10 ** (-20 / 20)
+
+                # Use utils.record to play & record using the configured devices
+                rec = utils.record(
+                    out,
+                    samplerate,
+                    [self.config.get("measurement_left_channel", 0) + 1,
+                     self.config.get("measurement_right_channel", 1) + 1],
+                    [self.config.get("playback_left_channel", 0) + 1,
+                     self.config.get("playback_right_channel", 1) + 1]
+                )
+                # save individual channels
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_left_L_{idx}.wav"),
+                    samplerate,
+                    rec[:, 0]
+                )
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_left_R_{idx}.wav"),
+                    samplerate,
+                    rec[:, 1]
+                )
+                # Use stimulus deconvolution
+                RIRs = testStimulus.deconvolve(rec)
+                if idx == 0:
+                    full_RIRs_L = RIRs.copy()
+                H_LL_raws.append(RIRs[start_idx:start_idx + hrir_len, 0])
+                H_RL_raws.append(RIRs[start_idx:start_idx + hrir_len, 1])
+            # Right speaker to both ears
+            H_LR_raws, H_RR_raws = [], []
+            for idx in range(n_sweeps):
+                out = np.zeros((sweep_len, 2))
+                out[:, 1] = sweep
+                # out[:, 1] *= 10 ** (-20 / 20)
+
+                # Use utils.record to play & record using the configured devices
+                rec = utils.record(
+                    out,
+                    samplerate,
+                    [self.config.get("measurement_left_channel", 0) + 1,
+                     self.config.get("measurement_right_channel", 1) + 1],
+                    [self.config.get("playback_left_channel", 0) + 1,
+                     self.config.get("playback_right_channel", 1) + 1]
+                )
+                # save individual channels
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_right_L_{idx}.wav"),
+                    samplerate,
+                    rec[:, 0]
+                )
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_right_R_{idx}.wav"),
+                    samplerate,
+                    rec[:, 1]
+                )
+                RIRs = testStimulus.deconvolve(rec)
+                if idx == 0:
+                    full_RIRs_R = RIRs.copy()
+                H_LR_raws.append(RIRs[start_idx:start_idx + hrir_len, 0])
+                H_RR_raws.append(RIRs[start_idx:start_idx + hrir_len, 1])
+            # Plot full deconvolved IRs for first sweep
+            # (full_RIRs_L and full_RIRs_R are [samples, 2] arrays)
+            if full_RIRs_L is not None and full_RIRs_R is not None:
+                t_full = np.arange(full_RIRs_L.shape[0]) / samplerate
+                fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+                axs[0, 0].plot(t_full, full_RIRs_L[:, 0]); axs[0, 0].set_title('DECONV_IRS_HLL')
+                axs[0, 1].plot(t_full, full_RIRs_R[:, 0]); axs[0, 1].set_title('DECONV_IRS_HLR')
+                axs[1, 0].plot(t_full, full_RIRs_L[:, 1]); axs[1, 0].set_title('DECONV_IRS_HRL')
+                axs[1, 1].plot(t_full, full_RIRs_R[:, 1]); axs[1, 1].set_title('DECONV_IRS_HRR')
+                for ax in axs.flatten():
+                    ax.set_xlabel('Time (s)')
+                    ax.set_ylabel('Amplitude')
+                plt.tight_layout()
+                plt.savefig(os.path.join(results_dir, 'untrimmed_hrirs_time_domain.png'))
+                # Display the deconvolution IRs interactively
+                # fig.show()
+                # Do not close immediately so the window stays open
+                plt.close(fig)
+
+            # For now, use only the first sweep
+            H_LL_raw, H_RL_raw = H_LL_raws[0], H_RL_raws[0]
+            H_LR_raw, H_RR_raw = H_LR_raws[0], H_RR_raws[0]
+
+
+            # Apply this to each HRIR
+            # print(f"Bulk delay roll index: {roll_idx}")
+            # print("This corresponds to a delay of {:.2f} ms".format(roll_idx / samplerate * 1000))
+            # print("which is {} meters at the speed of sound (343 m/s)".format(
+            #     roll_idx / samplerate * 343
+            # ))
+
+            # Plot raw HRIRs time-domain
+            import matplotlib.pyplot as plt
+            t_raw = np.arange(hrir_len) / samplerate
+            fig_raw, axs_raw = plt.subplots(2, 2, figsize=(10, 8))
+            axs_raw[0, 0].plot(t_raw, H_LL_raw); axs_raw[0, 0].set_title('Raw HRIR H_LL')
+            axs_raw[0, 1].plot(t_raw, H_LR_raw); axs_raw[0, 1].set_title('Raw HRIR H_LR')
+            axs_raw[1, 0].plot(t_raw, H_RL_raw); axs_raw[1, 0].set_title('Raw HRIR H_RL')
+            axs_raw[1, 1].plot(t_raw, H_RR_raw); axs_raw[1, 1].set_title('Raw HRIR H_RR')
+            plt.tight_layout()
+            plt.savefig(os.path.join(results_dir, "hrirs_time_domain.png"))
+            plt.close(fig_raw)
+            def remove_bulk_delay(ir, threshold_db=-40):
+                magnitude_db = 20 * np.log10(np.abs(ir) / np.max(np.abs(ir)) + 1e-12)
+                idx_first_above_threshold = np.argmax(magnitude_db >= threshold_db)
+                return idx_first_above_threshold
+            H_LL_raw_idx = remove_bulk_delay(H_LL_raw)
+            H_LR_raw_idx = remove_bulk_delay(H_LR_raw)
+            H_RL_raw_idx = remove_bulk_delay(H_RL_raw)
+            H_RR_raw_idx = remove_bulk_delay(H_RR_raw)
+
+            roll_idx = min(H_LL_raw_idx, H_LR_raw_idx, H_RL_raw_idx, H_RR_raw_idx)
+
+
+            H_LL_raw = H_LL_raw[roll_idx:]
+            H_LR_raw = H_LR_raw[roll_idx:]
+            H_RL_raw = H_RL_raw[roll_idx:]
+            H_RR_raw = H_RR_raw[roll_idx:]
+
+            # Normalise raw HRIRs to 0 dB peak
+            # find HRIR peak
+            peak = max(np.max(np.abs(H_LL_raw)), 
+                        np.max(np.abs(H_LR_raw)),
+                        np.max(np.abs(H_RL_raw)),
+                        np.max(np.abs(H_RR_raw)))
+            H_LL_raw /= peak
+            H_LR_raw /= peak
+            H_RL_raw /= peak
+            H_RR_raw /= peak
+
+            hrir_len = len(H_LL_raw)
+            assert hrir_len == len(H_LR_raw) == len(H_RL_raw) == len(H_RR_raw), "HRIR lengths do not match!"
+            t_raw = np.arange(hrir_len) / samplerate
+            fig_raw, axs_raw = plt.subplots(2, 2, figsize=(10, 8))
+            axs_raw[0, 0].plot(t_raw, H_LL_raw); axs_raw[0, 0].set_title('HRIR H_LL')
+            axs_raw[0, 1].plot(t_raw, H_LR_raw); axs_raw[0, 1].set_title('HRIR H_LR')
+            axs_raw[1, 0].plot(t_raw, H_RL_raw); axs_raw[1, 0].set_title('HRIR H_RL')
+            axs_raw[1, 1].plot(t_raw, H_RR_raw); axs_raw[1, 1].set_title('HRIR H_RR')
+            plt.tight_layout()
+            plt.savefig(os.path.join(results_dir, "hrirs_time_domain_normalised.png"))
+            plt.close(fig_raw)
+
+
+            # --- Plot all HRTF FFTs in one 2×2 subplot figure ---
+            H_LL_fft = np.fft.fft(H_LL_raw, n=sweep_len)
+            H_LR_fft = np.fft.fft(H_LR_raw, n=sweep_len)
+            H_RL_fft = np.fft.fft(H_RL_raw, n=sweep_len)
+            H_RR_fft = np.fft.fft(H_RR_raw, n=sweep_len)
+            freqs = np.fft.fftfreq(sweep_len, d=1.0 / samplerate)
+            fig_hrtf, axs_hrtf = plt.subplots(2, 2, figsize=(10, 8))
+            axs_hrtf[0, 0].plot(freqs[:sweep_len//2], 20 * np.log10(np.abs(H_LL_fft[:sweep_len//2]) + 1e-9))
+            axs_hrtf[0, 0].set_title("H_LL")
+            axs_hrtf[0, 1].plot(freqs[:sweep_len//2], 20 * np.log10(np.abs(H_LR_fft[:sweep_len//2]) + 1e-9))
+            axs_hrtf[0, 1].set_title("H_LR")
+            axs_hrtf[1, 0].plot(freqs[:sweep_len//2], 20 * np.log10(np.abs(H_RL_fft[:sweep_len//2]) + 1e-9))
+            axs_hrtf[1, 0].set_title("H_RL")
+            axs_hrtf[1, 1].plot(freqs[:sweep_len//2], 20 * np.log10(np.abs(H_RR_fft[:sweep_len//2]) + 1e-9))
+            axs_hrtf[1, 1].set_title("H_RR")
+            for ax in axs_hrtf.flatten():
+                ax.set_xlabel("Frequency (Hz)")
+                ax.set_ylabel("Magnitude (dB)")
+            plt.tight_layout()
+            fig_hrtf.savefig(os.path.join(results_dir, "hrtf_fft_matrix.png"))
+            plt.close(fig_hrtf)
+
+            # --- Step 6: Generate frequency-domain filter kernels ---
+            # FLL_real, FLR_real, FRL_real, FRR_real = xtc.generate_real_kn_filter(
+            #     H_LL_raw, H_LR_raw, H_RL_raw, H_RR_raw, filter_length=sweep_len, samplerate=samplerate, debug=False
+            # )
+
+            FLL_real, FLR_real, FRL_real, FRR_real = xtc.generate_real_kn_filter_fd(
+                H_LL_fft, H_LR_fft, H_RL_fft, H_RR_fft, filter_length=sweep_len, samplerate=samplerate, debug=False
+            )
+            # Set filter matrix
+            self.FLL = FLL_real 
+            self.FLR = FLR_real
+            self.FRL = FRL_real
+            self.FRR = FRR_real
+
+
+            H_mat = np.array([[H_LL_raw, H_LR_raw], [H_RL_raw, H_RR_raw]])
+
+            N = len(FLL_real)
+            H_f = np.zeros((2, 2, N), dtype=complex)
+            for i in range(2):
+                for j in range(2):
+                    H_f[i, j, :] = fft(H_mat[i][j], n=N)
+
+            HLL_raw_fft = H_f[0, 0, :]
+            HLR_raw_fft = H_f[0, 1, :]
+            HRL_raw_fft = H_f[1, 0, :]
+            HRR_raw_fft = H_f[1, 1, :]
+
+
+            # --- Plot filter FFT magnitude matrix ---
+            # Removed local imports of matplotlib.pyplot and numpy to avoid shadowing global np and plt
+            freqs = np.fft.rfftfreq(N, d=1.0 / samplerate)
+            fig1, axs1 = plt.subplots(2, 2, figsize=(10, 8))
+            axs1 = axs1.flatten()
+            axs1[0].plot(freqs, 20 * np.log10(np.abs(FLL_real[:len(freqs)]) + 1e-12))
+            axs1[0].set_title("F_LL")
+            axs1[0].set_xlabel("Frequency (Hz)")
+            axs1[0].set_ylabel("Magnitude (dB)")
+            axs1[1].plot(freqs, 20 * np.log10(np.abs(FLR_real[:len(freqs)]) + 1e-12))
+            axs1[1].set_title("F_LR")
+            axs1[1].set_xlabel("Frequency (Hz)")
+            axs1[1].set_ylabel("Magnitude (dB)")
+            axs1[2].plot(freqs, 20 * np.log10(np.abs(FRL_real[:len(freqs)]) + 1e-12))
+            axs1[2].set_title("F_RL")
+            axs1[2].set_xlabel("Frequency (Hz)")
+            axs1[2].set_ylabel("Magnitude (dB)")
+            axs1[3].plot(freqs, 20 * np.log10(np.abs(FRR_real[:len(freqs)]) + 1e-12))
+            axs1[3].set_title("F_RR")
+            axs1[3].set_xlabel("Frequency (Hz)")
+            axs1[3].set_ylabel("Magnitude (dB)")
+            plt.tight_layout()
+            plt.savefig(os.path.join(results_dir, "filter_matrix_fft_kn.png"))
+            plt.close(fig1)
+
+            # --- Step 3a: Compute HF products and plot ---
+            # H_LL_fft, H_LR_fft, H_RL_fft, H_RR_fft are already computed above
+            print("Lengths of FLL, FLR, FRL, FRR:", len(self.FLL), len(self.FLR), len(self.FRL), len(self.FRR))
+            print("Lengths of H_LL_fft, H_LR_fft, H_RL_fft, H_RR_fft:",
+                  len(H_LL_fft), len(H_LR_fft), len(H_RL_fft), len(H_RR_fft))
+
+            freqs = np.fft.rfftfreq(N, d=1.0 / samplerate)
+
+            X_LL = HLL_raw_fft * self.FLL + HLR_raw_fft * self.FRL
+            X_LR = HLL_raw_fft * self.FLR + HLR_raw_fft * self.FRR
+            X_RL = HRL_raw_fft * self.FLL + HRR_raw_fft * self.FRL
+            X_RR = HRL_raw_fft * self.FLR + HRR_raw_fft * self.FRR
+
+            fig_filt, axs_filt = plt.subplots(2, 2, figsize=(10, 8))
+            axs_filt = axs_filt.flatten()
+            axs_filt[0].plot(freqs, 20 * np.log10(np.abs(X_LL[:len(freqs)]) + 1e-12))
+            axs_filt[0].set_title("X_LL")
+            axs_filt[0].set_xlabel("Frequency (Hz)")
+            axs_filt[0].set_ylabel("Magnitude (dB)")
+            axs_filt[1].plot(freqs, 20 * np.log10(np.abs(X_LR[:len(freqs)]) + 1e-12))
+            axs_filt[1].set_title("X_LR")
+            axs_filt[1].set_xlabel("Frequency (Hz)")
+            axs_filt[1].set_ylabel("Magnitude (dB)")
+            axs_filt[2].plot(freqs, 20 * np.log10(np.abs(X_RL[:len(freqs)]) + 1e-12))
+            axs_filt[2].set_title("X_RL")
+            axs_filt[2].set_xlabel("Frequency (Hz)")
+            axs_filt[2].set_ylabel("Magnitude (dB)")
+            axs_filt[3].plot(freqs, 20 * np.log10(np.abs(X_RR[:len(freqs)]) + 1e-12))
+            axs_filt[3].set_title("X_RR")
+            axs_filt[3].set_xlabel("Frequency (Hz)")
+            axs_filt[3].set_ylabel("Magnitude (dB)")
+            plt.tight_layout()
+            plt.savefig(os.path.join(results_dir, 'HF_product_matrix_kn.png'))
+            plt.close(fig_filt)
+
+            # --- Step 3b: Physical measurement through AudioEngine + binaural device ---
+            # Route playback through binaural renderer
+            # Update engine to use binaural device and enable filters
+            self.update_audio_engine()
+
+
+            # Save original routing
+            # Query device indices
+            # Pre-trigger for windowing
+            pre_trigger = int(0.004 * samplerate)
+            # Measure filtered left-input through engine
+            fLL = np.real(np.fft.ifft(self.FLL))
+            fLR = np.real(np.fft.ifft(self.FLR))
+            fRL = np.real(np.fft.ifft(self.FRL))
+            fRR = np.real(np.fft.ifft(self.FRR))
+
+
+            normalize = np.max(np.abs(fLL)) + np.max(np.abs(fLR)) + np.max(np.abs(fRL)) + np.max(np.abs(fRR))
+            fLL /= normalize
+            fLR /= normalize
+            fRL /= normalize
+            fRR /= normalize
+
+            first_idx_ll = remove_bulk_delay(fLL)
+            first_idx_lr = remove_bulk_delay(fLR)
+            first_idx_rl = remove_bulk_delay(fRL)
+            first_idx_rr = remove_bulk_delay(fRR)
+
+            start_idx = min(first_idx_ll, first_idx_lr, first_idx_rl, first_idx_rr)
+            
+
+            # plot filter IRs.
+            fig_ir, axs_ir = plt.subplots(2, 2, figsize=(10, 8))
+            axs_ir[0, 0].plot(fLL)
+            axs_ir[0, 0].set_title("Filter fLL Impulse Response")
+            axs_ir[0, 1].plot(fLR)
+            axs_ir[0, 1].set_title("Filter fLR Impulse Response")
+            axs_ir[1, 0].plot(fRL)
+            axs_ir[1, 0].set_title("Filter fRL Impulse Response")
+            axs_ir[1, 1].plot(fRR)
+            axs_ir[1, 1].set_title("Filter fRR Impulse Response")
+            plt.tight_layout()
+            fig_ir.savefig(os.path.join(results_dir, "filter_impulse_responses_kn.png"))
+            plt.close(fig_ir)
+
+            fLL = fLL[start_idx:]
+            fLR = fLR[start_idx:]
+            fRL = fRL[start_idx:]
+            fRR = fRR[start_idx:]
+
+            fig_ir, axs_ir = plt.subplots(2, 2, figsize=(10, 8))
+            axs_ir[0, 0].plot(fLL)
+            axs_ir[0, 0].set_title("Filter fLL Impulse Response")
+            axs_ir[0, 1].plot(fLR)
+            axs_ir[0, 1].set_title("Filter fLR Impulse Response")
+            axs_ir[1, 0].plot(fRL)
+            axs_ir[1, 0].set_title("Filter fRL Impulse Response")
+            axs_ir[1, 1].plot(fRR)
+            axs_ir[1, 1].set_title("Filter fRR Impulse Response")
+            plt.tight_layout()
+            fig_ir.savefig(os.path.join(results_dir, "rolled_filter_impulse_responses_kn.png"))
+            plt.close(fig_ir)
+
+            filter_len = max(len(fLL), len(fLR), len(fRL), len(fRR))
+
+            # Left channel to both ears, assume s_r = 0
+            HF_LL_raws, HF_RL_raws = [], []
+            for idx in range(n_sweeps):
+                # left ear left channel = fLL * sweep + fLR * sweep
+                sweepfft = np.fft.fft(sweep, n=filter_len)
+                filtered_left = np.fft.ifft(self.FLL * sweepfft)
+                filtered_right = np.fft.ifft(self.FRL * sweepfft)
+                conv_len       = len(filtered_left)  # = sweep_len + len(fLL) - 1
+                out = np.zeros((conv_len, 2))
+                out[:, 0] = filtered_left
+                out[:, 1] = filtered_right
+                # out[:, 0] *= 10 ** (-20 / 20)
+                # out[:, 1] *= 10 ** (-20 / 20)
+
+                # Use utils.record to play & record using the configured devices
+                rec = utils.record(
+                    out,
+                    samplerate,
+                    [self.config.get("measurement_left_channel", 0) + 1,
+                     self.config.get("measurement_right_channel", 1) + 1],
+                    [self.config.get("playback_left_channel", 0) + 1,
+                     self.config.get("playback_right_channel", 1) + 1]
+                )
+                # save individual channels
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_left_L_{idx}_FILTERED_kn.wav"),
+                    samplerate,
+                    rec[:, 0]
+                )
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_left_R_{idx}_FILTERED_kn.wav"),
+                    samplerate,
+                    rec[:, 1]
+                )
+                # Use stimulus deconvolution
+                RIRs = testStimulus.deconvolve(rec)
+                if idx == 0:
+                    full_RIRs_L = RIRs.copy()
+                HF_LL_raws.append(RIRs[start_idx:start_idx + filter_len, 0])
+                HF_RL_raws.append(RIRs[start_idx:start_idx + filter_len, 1])
+            # Right speaker to both ears
+
+
+            HF_LR_raws, HF_RR_raws = [], []
+            for idx in range(n_sweeps):
+                sweepfft = np.fft.fft(sweep, n=filter_len)
+                filtered_left  = np.fft.ifft(self.FRL * sweepfft)
+                filtered_right = np.fft.ifft(self.FRR * sweepfft)
+                conv_len       = len(filtered_left)  # = sweep_len + len(fRL) - 1
+                out = np.zeros((conv_len, 2))
+                out[:, 0] = filtered_left
+                out[:, 1] = filtered_right
+                # out[:, 0] *= 10 ** (-20 / 20)
+                # out[:, 1] *= 10 ** (-20 / 20)
+
+                # Use utils.record to play & record using the configured devices
+                rec = utils.record(
+                    out,
+                    samplerate,
+                    [self.config.get("measurement_left_channel", 0) + 1,
+                     self.config.get("measurement_right_channel", 1) + 1],
+                    [self.config.get("playback_left_channel", 0) + 1,
+                     self.config.get("playback_right_channel", 1) + 1]
+                )
+                # save individual channels
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_right_L_{idx}_FILTERED_kn.wav"),
+                    samplerate,
+                    rec[:, 0]
+                )
+                wavwrite(
+                    os.path.join(results_dir, f"sweep_right_R_{idx}_FILTERED_kn.wav"),
+                    samplerate,
+                    rec[:, 1]
+                )
+                RIRs = testStimulus.deconvolve(rec)
+                if idx == 0:
+                    full_RIRs_R = RIRs.copy()
+                HF_LR_raws.append(RIRs[start_idx:start_idx + filter_len, 0])
+                HF_RR_raws.append(RIRs[start_idx:start_idx + filter_len, 1])
+            
+
+            if full_RIRs_L is not None and full_RIRs_R is not None:
+                t_full = np.arange(full_RIRs_L.shape[0]) / samplerate
+                fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+                axs[0, 0].plot(t_full, full_RIRs_L[:, 0]); axs[0, 0].set_title('DECONV_IRS_HLL')
+                axs[0, 1].plot(t_full, full_RIRs_R[:, 0]); axs[0, 1].set_title('DECONV_IRS_HLR')
+                axs[1, 0].plot(t_full, full_RIRs_L[:, 1]); axs[1, 0].set_title('DECONV_IRS_HRL')
+                axs[1, 1].plot(t_full, full_RIRs_R[:, 1]); axs[1, 1].set_title('DECONV_IRS_HRR')
+                for ax in axs.flatten():
+                    ax.set_xlabel('Time (s)')
+                    ax.set_ylabel('Amplitude')
+                plt.tight_layout()
+                plt.savefig(os.path.join(results_dir, 'untrimmed_hrirs_time_domain_FILTERED_kn.png'))
+                # Display the deconvolution IRs interactively
+                # fig.show()
+                # Do not close immediately so the window stays open
+                plt.close(fig)
+                # --- Plot FFTs of filtered HRIRs (crosstalk-cancelled) ---
+                # Prepare dictionary of the first sweep's crosstalk-cancelled HRIR segments
+                # --- Plot FFTs of filtered HRIRs in a single 2×2 subplot figure ---
+            Hfs = {
+                'Hf_LL': HF_LL_raws[0],
+                'Hf_RL': HF_RL_raws[0],
+                'Hf_LR': HF_LR_raws[0],
+                'Hf_RR': HF_RR_raws[0],
+            }
+            freqs = np.fft.rfftfreq(filter_len, d=1.0 / samplerate)
+            fig_fft, axs_fft = plt.subplots(2, 2, figsize=(10, 8))
+            for ax, (label, data) in zip(axs_fft.flatten(), Hfs.items()):
+                H = np.fft.rfft(data, n=filter_len)
+                ax.plot(freqs, 20 * np.log10(np.abs(H) + 1e-12))
+                ax.set_title(f'Filtered HRIR FFT: {label}')
+                ax.set_xlabel('Frequency (Hz)')
+                ax.set_ylabel('Magnitude (dB)')
+            plt.tight_layout()
+            fig_fft.savefig(os.path.join(results_dir, 'filtered_hrir_fft_matrix_kn.png'))
+            plt.close(fig_fft)
+            
+
+
+            
+
+
+
+
+
         def get_acoustics_data(self):
             with self.filter_lock:
                 # Compute propagation delays to the head (in samples)
@@ -1101,10 +1696,10 @@ def xtc_lab_processor():
                 freqs = np.fft.fftfreq(N, d=1/self.samplerate)
                 omega = 2 * np.pi * freqs
 
-                X_LL = H_ll*F_ll + H_lr*F_rl
-                X_LR = H_ll*F_lr + H_lr*F_rr
-                X_RL = H_rl*F_ll + H_rr*F_rl
-                X_RR = H_rl*F_lr + H_rr*F_rr
+                X_LL = H_ll*F_ll + H_lr*F_rl #left ear left channel
+                X_LR = H_ll*F_lr + H_lr*F_rr #left ear right channel
+                X_RL = H_rl*F_ll + H_rr*F_rl #right ear left channel
+                X_RR = H_rl*F_lr + H_rr*F_rr #right ear right channel
 
                 x_LL = np.fft.ifft(X_LL)
                 x_LR = np.fft.ifft(X_LR)
@@ -1230,7 +1825,7 @@ def xtc_lab_processor():
                 delay_ms = (dist_m/c)*1000
                 mid = (spk+ear)/2.0
                 mid_scaled = mid*scale_factor
-            if not self.headtrack_checkbox.isChecked():
+            if not self.bypass_checkbox.isChecked():
                 self.reload_filters()
                 lines = self.get_acoustics_data()
                 for i, data in enumerate(lines):
@@ -1381,17 +1976,17 @@ def xtc_lab_processor():
             # Expecting yaw as first argument
             if args:
                 try:
-                    print(f"OSC message received: {address} with args {args}")
+                    # print(f"OSC message received: {address} with args {args}")
                     if address == "/ypr":
-                        print(f"[HeadTracker] Yaw received: {args[0]}")
+                        # print(f"[HeadTracker] Yaw received: {args[0]}")
                         self.head_yaw = -float(args[0])
                 except ValueError:
                     pass
 
         def update_headtrack(self):
-            print("[HeadTracker] Timer tick")
+            # print("[HeadTracker] Timer tick")
             if self.headtracker_enabled:
-                print(f"[HeadTracker] Updating plot with yaw: {self.head_yaw}")
+                # print(f"[HeadTracker] Updating plot with yaw: {self.head_yaw}")
                 # Update head rotation and redraw top-down plot
                 self.head_rotation = self.head_yaw + self.head_rotation_offset
                 self.update_plot()
@@ -1448,4 +2043,5 @@ def xtc_lab_processor():
 if __name__ == "__main__":
     setup_audio_routing()
     xtc_lab_processor()
+
 
