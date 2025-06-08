@@ -566,6 +566,19 @@ def xtc_lab_processor():
                     f12 = np.real(np.fft.ifft(self.FLR))
                     f21 = np.real(np.fft.ifft(self.FRL))
                     f22 = np.real(np.fft.ifft(self.FRR))
+
+                    f11 = np.roll(f11, -len(f11) // 2)  # Center the impulse response
+                    f12 = np.roll(f12, -len(f11) // 2)
+                    f21 = np.roll(f21, -len(f11) // 2)
+                    f22 = np.roll(f22, -len(f11) // 2)
+                    # window around the centre to achieve length of 8,192
+                    # index to centre point - 8192/2
+                    center_index = len(f11) // 2
+                    f11 = f11[center_index - 1024:center_index + 1024]
+                    f12 = f12[center_index - 1024:center_index + 1024]
+                    f21 = f21[center_index - 1024:center_index + 1024]
+                    f22 = f22[center_index - 1024:center_index + 1024]
+
                     print("Passing time-domain filters to AudioEngine")
                 else:
                     f11 = self.fll
@@ -1089,7 +1102,7 @@ def xtc_lab_processor():
         
         def grab_hrirs(self):
             # Create results directory
-            results_dir = os.path.join("results", "reality_inversions_kn")
+            results_dir = os.path.join("results", "reality_inversions_kn_will_0deg")
             if not os.path.exists(results_dir):
                 os.makedirs(results_dir)
 
@@ -1136,7 +1149,6 @@ def xtc_lab_processor():
             # --- Step 1: Generate Farina sweep and inverse filter using stimulus class ---
             import matplotlib.pyplot as plt
             # Ensure results directory for plots exists
-            results_dir = os.path.join("results", "reality_inversions_kn")
             if not os.path.exists(results_dir):
                 os.makedirs(results_dir)
             # Placeholders for full deconvolved IRs (first sweep)
@@ -1147,8 +1159,8 @@ def xtc_lab_processor():
             sweep_len = int(samplerate * sweep_duration)
             n_sweeps = 1
             hrir_len = 32768
-            start_freq = 20.0
-            end_freq = 20000.0
+            start_freq = 50
+            end_freq = 16000.0
 
             filter_length_samples = 16384  # Length of the filter to be generated
 
@@ -1176,7 +1188,7 @@ def xtc_lab_processor():
                 out = np.zeros((sweep_len, 2))
 
                 out[:, 0] = sweep
-                # out[:, 0] *= 10 ** (-20 / 20)
+                out[:, 0] *= 10 ** (-10 / 20)
 
                 # Use utils.record to play & record using the configured devices
                 rec = utils.record(
@@ -1209,7 +1221,7 @@ def xtc_lab_processor():
             for idx in range(n_sweeps):
                 out = np.zeros((sweep_len, 2))
                 out[:, 1] = sweep
-                # out[:, 1] *= 10 ** (-20 / 20)
+                out[:, 1] *= 10 ** (-10 / 20)
 
                 # Use utils.record to play & record using the configured devices
                 rec = utils.record(
@@ -1502,12 +1514,13 @@ def xtc_lab_processor():
                 sweepfft = np.fft.fft(sweep, n=filter_len)
                 filtered_left = np.fft.ifft(self.FLL * sweepfft)
                 filtered_right = np.fft.ifft(self.FRL * sweepfft)
+
                 conv_len       = len(filtered_left)  # = sweep_len + len(fLL) - 1
                 out = np.zeros((conv_len, 2))
                 out[:, 0] = filtered_left
                 out[:, 1] = filtered_right
-                # out[:, 0] *= 10 ** (-20 / 20)
-                # out[:, 1] *= 10 ** (-20 / 20)
+                out[:, 0] *= 10 ** (-15 / 20)
+                out[:, 1] *= 10 ** (-15 / 20)
 
                 # Use utils.record to play & record using the configured devices
                 rec = utils.record(
@@ -1530,6 +1543,8 @@ def xtc_lab_processor():
                     rec[:, 1]
                 )
                 # Use stimulus deconvolution
+                rec_LL = rec[:, 0]
+                rec_RL = rec[:, 1]
                 RIRs = testStimulus.deconvolve(rec)
                 if idx == 0:
                     full_RIRs_L = RIRs.copy()
@@ -1541,14 +1556,14 @@ def xtc_lab_processor():
             HF_LR_raws, HF_RR_raws = [], []
             for idx in range(n_sweeps):
                 sweepfft = np.fft.fft(sweep, n=filter_len)
-                filtered_left  = np.fft.ifft(self.FRL * sweepfft)
+                filtered_left  = np.fft.ifft(self.FLR * sweepfft)
                 filtered_right = np.fft.ifft(self.FRR * sweepfft)
                 conv_len       = len(filtered_left)  # = sweep_len + len(fRL) - 1
                 out = np.zeros((conv_len, 2))
                 out[:, 0] = filtered_left
                 out[:, 1] = filtered_right
-                # out[:, 0] *= 10 ** (-20 / 20)
-                # out[:, 1] *= 10 ** (-20 / 20)
+                out[:, 0] *= 10 ** (-15 / 20)
+                out[:, 1] *= 10 ** (-15 / 20)
 
                 # Use utils.record to play & record using the configured devices
                 rec = utils.record(
@@ -1570,6 +1585,8 @@ def xtc_lab_processor():
                     samplerate,
                     rec[:, 1]
                 )
+                rec_LR = rec[:, 0]
+                rec_RR = rec[:, 1]
                 RIRs = testStimulus.deconvolve(rec)
                 if idx == 0:
                     full_RIRs_R = RIRs.copy()
@@ -1597,10 +1614,10 @@ def xtc_lab_processor():
                 # Prepare dictionary of the first sweep's crosstalk-cancelled HRIR segments
                 # --- Plot FFTs of filtered HRIRs in a single 2×2 subplot figure ---
             Hfs = {
-                'Hf_LL': HF_LL_raws[0],
-                'Hf_RL': HF_RL_raws[0],
-                'Hf_LR': HF_LR_raws[0],
-                'Hf_RR': HF_RR_raws[0],
+                'Hf_LL': rec_LL,
+                'Hf_RL': rec_RL,
+                'Hf_LR': rec_LR,
+                'Hf_RR': rec_RR,
             }
             freqs = np.fft.rfftfreq(filter_len, d=1.0 / samplerate)
             fig_fft, axs_fft = plt.subplots(2, 2, figsize=(10, 8))
@@ -1614,7 +1631,44 @@ def xtc_lab_processor():
             fig_fft.savefig(os.path.join(results_dir, 'filtered_hrir_fft_matrix_kn.png'))
             plt.close(fig_fft)
             
+            output_dir = "results/xtc_data_will_0deg"
+            os.makedirs(output_dir, exist_ok=True)
 
+            # Save original HRIRs
+            np.savetxt(os.path.join(output_dir, "H_LL_raw_ir.csv"), H_LL_raw, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "H_LR_raw_ir.csv"), H_LR_raw, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "H_RL_raw_ir.csv"), H_RL_raw, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "H_RR_raw_ir.csv"), H_RR_raw, delimiter=",")
+
+            # Save FFTs of original HRTFs
+            np.savetxt(os.path.join(output_dir, "H_LL_raw_fft.csv"), np.abs(H_LL_fft), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "H_LR_raw_fft.csv"), np.abs(H_LR_fft), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "H_RL_raw_fft.csv"), np.abs(H_RL_fft), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "H_RR_raw_fft.csv"), np.abs(H_RR_fft), delimiter=",")
+
+            # Save filter IRs
+            np.savetxt(os.path.join(output_dir, "fLL_ir.csv"), fLL, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "fLR_ir.csv"), fLR, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "fRL_ir.csv"), fRL, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "fRR_ir.csv"), fRR, delimiter=",")
+
+            # Save filter FFTs
+            np.savetxt(os.path.join(output_dir, "FLL_fft.csv"), np.abs(FLL_real), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "FLR_fft.csv"), np.abs(FLR_real), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "FRL_fft.csv"), np.abs(FRL_real), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "FRR_fft.csv"), np.abs(FRR_real), delimiter=",")
+
+            # Save HF product matrix
+            np.savetxt(os.path.join(output_dir, "X_LL_fft.csv"), np.abs(X_LL), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "X_LR_fft.csv"), np.abs(X_LR), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "X_RL_fft.csv"), np.abs(X_RL), delimiter=",")
+            np.savetxt(os.path.join(output_dir, "X_RR_fft.csv"), np.abs(X_RR), delimiter=",")
+
+            # Save second sweep IRs (post-filter measurement)
+            np.savetxt(os.path.join(output_dir, "M_LL.csv"), rec_LL, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "M_LR.csv"), rec_LR, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "M_RL.csv"), rec_RL, delimiter=",")
+            np.savetxt(os.path.join(output_dir, "M_RR.csv"), rec_RR, delimiter=",")
 
             
 

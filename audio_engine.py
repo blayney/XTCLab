@@ -143,7 +143,7 @@ class AudioEngine:
         self.fft_state['prev_l'] = new_prev_l
         self.fft_state['prev_r'] = new_prev_r
 
-        gain = 10 ** (-20 / 20)
+        gain = 1
         # Combine HP channels and return immediately (no cross-block alignment)
         sig_L = (sig_L1 + sig_L2) * gain
         sig_R = (sig_R1 + sig_R2) * gain
@@ -203,7 +203,8 @@ class AudioEngine:
         self.levels[1] = float(rms_in[1])
         # Bypass or missing filters → pass through
         if self.bypass or any(f is None for f in [self.f11, self.f12, self.f21, self.f22]):
-            output = input_buffer
+            gain = 10 ** (-10 / 20)
+            output = input_buffer * gain
         else:
             left = input_buffer[:, 0]
             right = input_buffer[:, 1]

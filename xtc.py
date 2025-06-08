@@ -965,13 +965,21 @@ def generate_real_kn_filter(
     for i in range(2):
         for j in range(2):
             H_f[i, j, :] = fft(H_mat[i][j], n=N)
-    
+    freqs = np.fft.fftfreq(N, d=1/samplerate)
+    def lambda_fn(k, N):
+        f = abs(freqs[k])
+        if f < 8000:
+            return 1e-4
+        elif f < 16000:
+            return 1e-3
+        else:
+            return lambda_freq * (1 + ((f - 8000) / 4000) **2)
     # Step 3: Frequency domain Kirkeby-Nelson inversion
     F_f = np.zeros((2, 2, N), dtype=complex)
     for k in range(N):
         Hk = H_f[:, :, k]
         Hk_H = Hk.conj().T
-        lambda_k = lambda_freq if np.isscalar(lambda_freq) else lambda_freq(k, N)
+        lambda_k = lambda_fn(k, N)
         inv = np.linalg.inv(Hk_H @ Hk + lambda_k * np.eye(2)) @ Hk_H
         F_f[:, :, k] = inv  # targeting D = identity matrix
 
@@ -1005,10 +1013,23 @@ def generate_real_kn_filter_fd(
     
     # Step 3: Frequency domain Kirkeby-Nelson inversion
     F_f = np.zeros((2, 2, N), dtype=complex)
+    # set lambda freq that supresses HF ringing
+    freqs = np.fft.fftfreq(N, d=1/samplerate)
+    def lambda_fn(k, N):
+        f = abs(freqs[k])
+        if f < 4000:
+            return 1e-3
+        elif f < 8000:
+            return 1e-2
+        elif f < 12000:
+            return 1e-1
+        else:
+            return lambda_freq * (1 + ((f - 8000) / 4000) **2)
+
     for k in range(N):
         Hk = H_f[:, :, k]
         Hk_H = Hk.conj().T
-        lambda_k = lambda_freq if np.isscalar(lambda_freq) else lambda_freq(k, N)
+        lambda_k = lambda_fn(k, N)
         inv = np.linalg.inv(Hk_H @ Hk + lambda_k * np.eye(2)) @ Hk_H
         F_f[:, :, k] = inv  # targeting D = identity matrix
 
@@ -1031,7 +1052,124 @@ def generate_real_kn_filter_fd(
     bpfilter = np.zeros(N, dtype=complex)
     freqs = np.fft.fftfreq(N, d=1/samplerate)
     for i in range(N):
-        if 400 <= abs(freqs[i]) <= 13000:
+        if 120 <= abs(freqs[i]) <= 10000:
+            bpfilter[i] = 1.0
+            if 10000< abs(freqs[i]) < 16000:
+                bpfilter[i] *= 0.8
+        # elif 10000 < abs(freqs[i]) < 16000:
+        #     bpfilter[i] = 0
+        else:
+            bpfilter[i] = 0.0
+    
+    FLL *= bpfilter
+    FLR *= bpfilter
+    FRL *= bpfilter
+    FRR *= bpfilter
+
+    # Store in cache and log stats
+    return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
+
+def generate_real_kn_filter_fd_smart(
+    H_LL, H_LR, H_RL, H_RR,
+    filter_length=16384, samplerate=48000, debug=False, lambda_freq=1e-4, format='FrequencyDomain'
+):
+    from scipy.fft import fft, fftfreq
+    c = 343.0
+    filter_length = len(H_LL)  # Use the length of the provided HRIRs
+    N = filter_length  # Use the provided filter length directly
+    H_f = np.array([[H_LL, H_LR], [H_RL, H_RR]])
+
+
+    # --- Helper functions for regularization optimization ---
+    def compute_filter_response(H_f, lambda_w):
+        N = H_f.shape[-1]
+        F_f = np.zeros_like(H_f)
+        for k in range(N):
+            Hk = H_f[:, :, k]
+            HkH = Hk @ Hk.conj().T
+            try:
+                inv_term = np.linalg.inv(HkH + lambda_w[k] * np.eye(2))
+                F_f[:, :, k] = Hk.conj().T @ inv_term
+            except np.linalg.LinAlgError:
+                F_f[:, :, k] = np.zeros((2, 2), dtype=complex)
+        return F_f
+    
+    def compute_regularization_error(log_lambdas, H_f, freqs, passband, beta=1.0):
+        # Interpolate log-scale lambda across frequency, with safe handling for nonpositive freqs
+        positive_freqs = freqs[freqs > 0]
+        control_freqs = np.geomspace(positive_freqs[0], positive_freqs[-1], len(log_lambdas))
+        lambda_interp_func = interp1d(np.log10(control_freqs), log_lambdas, kind='linear', fill_value="extrapolate")
+        # Safe interpolation: only for positive frequencies
+        log_lambda_w = np.full_like(freqs, fill_value=np.nan, dtype=float)
+        safe_mask = freqs > 0
+        log_lambda_w[safe_mask] = lambda_interp_func(np.log10(freqs[safe_mask]))
+        lambda_w = 10 ** log_lambda_w
+        # For negative/zero freqs, fallback to first positive value
+        if np.any(safe_mask):
+            lambda_w[~safe_mask] = lambda_w[safe_mask][0]
+        else:
+            lambda_w[:] = 1e-3  # fallback if no positive freqs (shouldn't happen)
+
+        F_f = compute_filter_response(H_f, lambda_w)
+        HF = np.einsum("ijk,jlk->ilk", H_f, F_f)  # H @ F
+
+        # Extract diagonal and off-diagonal elements
+        T_ipsi = np.abs(np.stack([HF[0, 0, :], HF[1, 1, :]]))
+        T_contra = np.abs(np.stack([HF[0, 1, :], HF[1, 0, :]]))
+
+        # Mask to passband only
+        T_ipsi = T_ipsi[:, passband]
+        T_contra = T_contra[:, passband]
+
+        flatness_error = np.mean((20 * np.log10(T_ipsi + 1e-12)) ** 2)
+        cancellation_error = np.mean(T_contra ** 2)
+
+        if np.any(np.isnan(HF)):
+            print("NaNs detected in HF matrix!")
+
+        return flatness_error + beta * cancellation_error
+
+    # Step 3: Frequency domain Kirkeby-Nelson inversion with optimized regularization profile
+    freqs = np.fft.fftfreq(N, d=1 / samplerate)
+    freq_mask = (freqs >= 100) & (freqs <= 7000)
+    init_log_lambda = np.full(8, np.log10(1e-4))
+    print("starting optimisation")
+    res = minimize(
+        compute_regularization_error,
+        init_log_lambda,
+        args=(H_f, freqs, freq_mask),
+        method='L-BFGS-B',
+        bounds=[(-8, 2)] * 8,
+        options={"maxiter": 25}
+    )
+
+    print("finished optimisation")
+
+
+    optimized_log_lambda = res.x
+    positive_freqs = freqs[freqs > 0]
+    control_freqs = np.geomspace(positive_freqs[0], positive_freqs[-1], len(optimized_log_lambda))
+    lambda_interp_func = interp1d(np.log10(control_freqs), optimized_log_lambda, kind='linear', fill_value="extrapolate")
+    # Safe interpolation: only for positive frequencies
+    log_lambda_w = np.full_like(freqs, fill_value=np.nan, dtype=float)
+    safe_mask = freqs > 0
+    log_lambda_w[safe_mask] = lambda_interp_func(np.log10(freqs[safe_mask]))
+    lambda_w = 10 ** log_lambda_w
+    if np.any(safe_mask):
+        lambda_w[~safe_mask] = lambda_w[safe_mask][0]
+    else:
+        lambda_w[:] = 1e-4
+
+    F_f = compute_filter_response(H_f, lambda_w)
+
+    FLL = F_f[0, 0, :]
+    FLR = F_f[0, 1, :]
+    FRL = F_f[1, 0, :]
+    FRR = F_f[1, 1, :]
+    bpfilter = np.zeros(N, dtype=complex)
+    freqs = np.fft.fftfreq(N, d=1/samplerate)
+    for i in range(N):
+        if 200 <= abs(freqs[i]) <= 10000:
             bpfilter[i] = 1.0
         else:
             bpfilter[i] = 0.0
@@ -1040,6 +1178,7 @@ def generate_real_kn_filter_fd(
     FLR *= bpfilter
     FRL *= bpfilter
     FRR *= bpfilter
+
 
     # Store in cache and log stats
     return FLL, FLR, FRL, FRR  # fll, flr, frl, frr
